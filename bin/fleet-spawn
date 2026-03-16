@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# fleet-spawn — Quick single-task launcher
+# Creates a temporary task file and runs fleet on it
+#
+# Usage:
+#   fleet-spawn "prompt text" [--workdir DIR] [--model MODEL] [--name NAME] [--ny]
+#
+# The --ny flag adds NammaYatri system prompt context automatically.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FLEET_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Defaults
+WORKDIR="."
+MODEL="opus"
+EFFORT="high"
+NAME=""
+NY_MODE=false
+ALLOWED_TOOLS="Read Grep Glob Bash Edit Write Agent"
+PROMPT=""
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --workdir) WORKDIR="$2"; shift 2 ;;
+        --model) MODEL="$2"; shift 2 ;;
+        --effort) EFFORT="$2"; shift 2 ;;
+        --name) NAME="$2"; shift 2 ;;
+        --ny) NY_MODE=true; shift ;;
+        --tools) ALLOWED_TOOLS="$2"; shift 2 ;;
+        --readonly) ALLOWED_TOOLS="Read Grep Glob Agent"; shift ;;
+        --help|-h)
+            echo "Usage: fleet-spawn \"prompt\" [options]"
+            echo ""
+            echo "Options:"
+            echo "  --workdir DIR    Working directory (default: .)"
+            echo "  --model MODEL    Model: opus, sonnet, haiku (default: opus)"
+            echo "  --effort LEVEL   Effort: high, medium, low (default: high)"
+            echo "  --name NAME      Task name (auto-generated if omitted)"
+            echo "  --ny             Add NammaYatri context (MCP instructions, architecture)"
+            echo "  --tools TOOLS    Allowed tools (default: Read Grep Glob Bash Edit Write Agent)"
+            echo "  --readonly       Shortcut for --tools 'Read Grep Glob Agent'"
+            echo ""
+            echo "Examples:"
+            echo "  fleet-spawn 'Find all TODO comments' --workdir ~/code/nammayatri --readonly"
+            echo "  fleet-spawn 'Fix error handling in rider service' --ny --workdir ~/code/nammayatri"
+            echo "  fleet-spawn 'Audit API security' --ny --readonly"
+            exit 0
+            ;;
+        *)
+            if [[ -z "$PROMPT" ]]; then
+                PROMPT="$1"
+            else
+                PROMPT="$PROMPT $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$PROMPT" ]]; then
+    echo "Error: prompt required"
+    echo "Usage: fleet-spawn \"prompt\" [--workdir DIR] [--model MODEL] [--ny]"
+    exit 1
+fi
+
+# Generate name from prompt if not provided
+if [[ -z "$NAME" ]]; then
+    NAME=$(echo "$PROMPT" | head -c 50 | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+fi
+
+ID="spawn-${NAME}-$(date +%s)"
+TASKS_FILE="/tmp/fleet-${ID}.json"
+
+# Build appendSystemPrompt
+APPEND_PROMPT=""
+if $NY_MODE; then
+    NY_PROMPT_FILE="$FLEET_DIR/templates/ny-system-prompt.md"
+    if [[ -f "$NY_PROMPT_FILE" ]]; then
+        APPEND_PROMPT=$(cat "$NY_PROMPT_FILE")
+    else
+        echo "Warning: NY system prompt not found at $NY_PROMPT_FILE"
+    fi
+fi
+
+# Create task JSON
+jq -n \
+    --arg id "$ID" \
+    --arg name "$NAME" \
+    --arg workdir "$WORKDIR" \
+    --arg prompt "$PROMPT" \
+    --arg model "$MODEL" \
+    --arg effort "$EFFORT" \
+    --arg tools "$ALLOWED_TOOLS" \
+    --arg append "$APPEND_PROMPT" \
+    '{tasks: [{
+        id: $id,
+        name: $name,
+        prompt: $prompt,
+        workdir: $workdir,
+        model: $model,
+        effort: $effort,
+        status: "pending",
+        allowedTools: $tools,
+        appendSystemPrompt: $append
+    }]}' > "$TASKS_FILE"
+
+echo "Task file: $TASKS_FILE"
+echo "Starting fleet..."
+
+# Run fleet in background
+"$SCRIPT_DIR/fleet" "$TASKS_FILE" &
+FLEET_PID=$!
+
+echo "Fleet PID: $FLEET_PID"
+echo ""
+echo "Monitor with: fleet-dashboard $TASKS_FILE"
+echo "Or check:     jq '.tasks[] | {name, status}' $TASKS_FILE"

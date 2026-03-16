@@ -16,6 +16,10 @@ bin/
   fleet-reset        # Resets all tasks to pending
   fleet-pipeline     # Multi-stage pipeline runner (sequential stages, parallel tasks)
   fleet-dashboard    # Real-time TUI dashboard (Python + rich)
+  fleet-spawn        # Quick single-task launcher (with --ny flag for NammaYatri context)
+templates/
+  ny-system-prompt.md    # appendSystemPrompt for NammaYatri tasks (MCP, architecture, ClickHouse)
+  tasks-ny-audit.md      # Pre-built NY audit task templates
 examples/
   tasks-hello-world.md   # Example tasks
   pipeline.json          # Example multi-stage pipeline config
@@ -98,6 +102,33 @@ logs/
     task-id.output.md        # extracted text content
     task-id.log              # stderr/errors
     state.json               # live status for dashboard
+```
+
+## Spawning from Claude Sessions
+
+Global slash commands are installed at `~/.claude/commands/`:
+- `/fleet <tasks-file>` — spawn a fleet run from any Claude session
+- `/fleet-status` — check status of running fleet
+
+Quick single-task spawn:
+```bash
+fleet-spawn "audit error handling" --ny --workdir ~/Documents/code/nammayatri --readonly
+fleet-spawn "fix logging in rider service" --ny --workdir ~/Documents/code/nammayatri
+```
+
+The `--ny` flag automatically injects NammaYatri context (architecture, MCP instructions, ClickHouse tables) via `appendSystemPrompt`.
+
+## NammaYatri Templates
+
+Pre-built task templates in `templates/`:
+- `tasks-ny-audit.md` — 5 audit tasks (error handling, security, code quality, observability, migrations)
+- `ny-system-prompt.md` — shared context injected via `appendSystemPrompt`
+
+Copy and customize:
+```bash
+cp templates/tasks-ny-audit.md tasks-my-audit.md
+# edit as needed
+fleet tasks-my-audit.md
 ```
 
 ## Tips

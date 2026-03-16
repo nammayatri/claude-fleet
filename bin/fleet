@@ -43,17 +43,26 @@ load_config
 
 TASKS_FILE="${1:-tasks.json}"
 
-# Auto-convert .md → .json if md is newer or json missing
-MD_FILE="${TASKS_FILE%.json}.md"
-if [[ "$TASKS_FILE" == *.json ]] && [[ -f "$MD_FILE" ]] && { [[ ! -f "$TASKS_FILE" ]] || [[ "$MD_FILE" -nt "$TASKS_FILE" ]]; }; then
+# Auto-convert .md → .json
+if [[ "$TASKS_FILE" == *.md ]]; then
+    MD_FILE="$TASKS_FILE"
+    TASKS_FILE="${TASKS_FILE%.md}.json"
     echo -e "\033[0;36m[fleet]\033[0m Converting $(basename "$MD_FILE") → $(basename "$TASKS_FILE")"
     "$BIN_DIR/fleet-convert" "$MD_FILE" "$TASKS_FILE"
+else
+    # Auto-convert .md → .json if md is newer or json missing
+    MD_FILE="${TASKS_FILE%.json}.md"
+    if [[ -f "$MD_FILE" ]] && { [[ ! -f "$TASKS_FILE" ]] || [[ "$MD_FILE" -nt "$TASKS_FILE" ]]; }; then
+        echo -e "\033[0;36m[fleet]\033[0m Converting $(basename "$MD_FILE") → $(basename "$TASKS_FILE")"
+        "$BIN_DIR/fleet-convert" "$MD_FILE" "$TASKS_FILE"
+    fi
 fi
 
 # Resolve LOG_DIR
 if [[ -z "$LOG_DIR" ]]; then
     LOG_DIR="./logs/$(date +%Y%m%d-%H%M%S)"
 fi
+[[ "$LOG_DIR" != /* ]] && LOG_DIR="$(pwd)/${LOG_DIR#./}"
 
 # CLI command resolution
 if [[ -z "$CLAUDE_CMD" ]]; then
@@ -130,6 +139,7 @@ if [[ "$MODE" == "interactive" ]]; then
         name=$(echo "$task_json" | jq -r '.name')
         prompt=$(echo "$task_json" | jq -r '.prompt')
         workdir=$(echo "$task_json" | jq -r '.workdir // "."')
+        workdir="${workdir/#\~/$HOME}"
         model=$(echo "$task_json" | jq -r '.model // "opus"')
         effort=$(echo "$task_json" | jq -r '.effort // "high"')
 
@@ -171,6 +181,7 @@ launch_task() {
     local name=$(echo "$task_json" | jq -r '.name')
     local prompt=$(echo "$task_json" | jq -r '.prompt')
     local workdir=$(echo "$task_json" | jq -r '.workdir // "."')
+    workdir="${workdir/#\~/$HOME}"
     local model=$(echo "$task_json" | jq -r ".model // \"$MODEL\"")
     local effort=$(echo "$task_json" | jq -r ".effort // \"$EFFORT\"")
     local allowed_tools=$(echo "$task_json" | jq -r '.allowedTools // ""')

@@ -10,42 +10,53 @@ Requires: pip install rich
 """
 
 import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.table import Table
     from rich.panel import Panel
     from rich.text import Text
-    from rich.columns import Columns
 except ImportError:
     print("Missing dependency: pip install rich")
     sys.exit(1)
+
+SPINNERS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_tick = 0
+
+
+def find_log_dir(tasks_file: Path) -> Path | None:
+    """Find the most recent log directory that has a state.json."""
+    # Check relative to tasks file directory first, then cwd
+    for base in [tasks_file.parent, Path(".")]:
+        log_dirs = sorted(
+            base.glob("logs/*/state.json"),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+        if log_dirs:
+            return log_dirs[0].parent
+    return None
 
 
 def find_files(arg: str):
     """Resolve tasks file and optional state file from CLI arg."""
     p = Path(arg)
     if p.is_dir():
-        # Log directory mode — look for state.json and find tasks file
         state_file = p / "state.json"
         tasks_file = None
-        # Try to find tasks file from state
-        if state_file.exists():
-            state = json.loads(state_file.read_text())
-            # state.json doesn't store tasks file path, scan parent
-        # Fallback: look for any tasks*.json in parent dirs
         for candidate in sorted(p.parent.glob("tasks*.json")):
             tasks_file = candidate
             break
         return tasks_file, state_file if state_file.exists() else None
     elif p.is_file() and p.suffix == ".json":
-        # Direct tasks file
-        log_dirs = sorted(Path(".").glob("logs/*/state.json"), key=lambda x: x.stat().st_mtime, reverse=True)
-        state_file = log_dirs[0] if log_dirs else None
+        log_dir = find_log_dir(p)
+        state_file = (log_dir / "state.json") if log_dir else None
         return p, state_file
     else:
         print(f"Not found: {arg}")
@@ -53,7 +64,6 @@ def find_files(arg: str):
 
 
 def load_tasks(tasks_file: Path) -> dict:
-    """Load tasks JSON, return dict with tasks list."""
     try:
         return json.loads(tasks_file.read_text())
     except (json.JSONDecodeError, FileNotFoundError):
@@ -61,7 +71,6 @@ def load_tasks(tasks_file: Path) -> dict:
 
 
 def load_state(state_file: Path | None) -> dict | None:
-    """Load state.json if available."""
     if state_file and state_file.exists():
         try:
             return json.loads(state_file.read_text())
@@ -80,29 +89,137 @@ def format_duration(seconds: int) -> str:
     return f"{h}h {m:02d}m"
 
 
+def format_size(nbytes: int) -> str:
+    if nbytes < 1024:
+        return f"{nbytes}B"
+    elif nbytes < 1024 * 1024:
+        return f"{nbytes / 1024:.1f}K"
+    else:
+        return f"{nbytes / (1024 * 1024):.1f}M"
+
+
 def make_progress_bar(elapsed: int, width: int = 8) -> str:
-    """Simple time-based progress bar (caps at ~30 min)."""
-    max_time = 1800  # 30 min assumed max
+    max_time = 1800
     filled = min(int((elapsed / max_time) * width), width)
     return "█" * filled + "░" * (width - filled)
 
 
+def get_last_activity(stream_file: Path) -> str:
+    """Get the last meaningful activity from the stream JSONL."""
+    if not stream_file.exists():
+        return ""
+    try:
+        # Read last few KB for efficiency
+        size = stream_file.stat().st_size
+        with open(stream_file, "rb") as f:
+            if size > 8192:
+                f.seek(size - 8192)
+            data = f.read().decode("utf-8", errors="replace")
+
+        # Parse lines in reverse to find last tool_use or text
+        last_tool = ""
+        last_text = ""
+        for line in reversed(data.strip().split("\n")):
+            if not line.strip():
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if ev.get("type") == "assistant":
+                for block in ev.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_use" and not last_tool:
+                        tool = block.get("name", "")
+                        inp = block.get("input", {})
+                        last_tool = _summarize_tool(tool, inp)
+                    elif block.get("type") == "text" and not last_text:
+                        text = block.get("text", "").strip()
+                        if text:
+                            last_text = text[:60]
+            elif ev.get("type") == "result" and not last_tool:
+                # tool result
+                pass
+
+            if last_tool:
+                break
+
+        return last_tool or last_text or ""
+    except Exception:
+        return ""
+
+
+def _summarize_tool(tool: str, inp: dict) -> str:
+    """One-line summary of a tool call."""
+    if tool == "Read":
+        fp = inp.get("file_path", "")
+        return f"Reading {Path(fp).name}" if fp else "Reading..."
+    elif tool == "Glob":
+        return f"Searching {inp.get('pattern', '...')}"
+    elif tool == "Grep":
+        pat = inp.get("pattern", "")
+        return f"Grep: {pat[:30]}" if pat else "Searching..."
+    elif tool == "Edit":
+        fp = inp.get("file_path", "")
+        return f"Editing {Path(fp).name}" if fp else "Editing..."
+    elif tool == "Write":
+        fp = inp.get("file_path", "")
+        return f"Writing {Path(fp).name}" if fp else "Writing..."
+    elif tool == "Bash":
+        cmd = inp.get("command", "")
+        return f"$ {cmd[:35]}" if cmd else "Running..."
+    elif tool == "Agent":
+        desc = inp.get("description", "")
+        return f"Agent: {desc[:30]}" if desc else "Agent..."
+    else:
+        return tool
+
+
+def count_tool_calls(stream_file: Path) -> int:
+    """Count tool_use blocks in stream file (fast: uses grep -c)."""
+    if not stream_file.exists():
+        return 0
+    try:
+        result = subprocess.run(
+            ["grep", "-c", '"tool_use"', str(stream_file)],
+            capture_output=True, text=True, timeout=2,
+        )
+        return int(result.stdout.strip()) if result.returncode == 0 else 0
+    except Exception:
+        return 0
+
+
 def build_display(tasks_file: Path, state_file: Path | None, start_time: float) -> Panel:
+    global _tick
+    _tick += 1
     now = time.time()
     data = load_tasks(tasks_file)
     state = load_state(state_file)
     tasks = data.get("tasks", [])
 
-    # Counts
+    log_dir = None
+    if state:
+        log_dir = Path(state.get("log_dir", ""))
+        if not log_dir.exists():
+            # Try relative to tasks file
+            log_dir = tasks_file.parent / state.get("log_dir", "")
+        if not log_dir.exists():
+            log_dir = None
+
+    # If no state log_dir, try to find it
+    if not log_dir:
+        log_dir = find_log_dir(tasks_file)
+
     counts = {"pending": 0, "running": 0, "done": 0, "failed": 0}
     for t in tasks:
         s = t.get("status", "pending")
         counts[s] = counts.get(s, 0) + 1
     total = len(tasks)
 
-    # Orchestrator start time
     orch_start = state.get("started_at", start_time) if state else start_time
     elapsed = int(now - orch_start)
+
+    spinner = SPINNERS[_tick % len(SPINNERS)]
 
     # Header
     header = Text()
@@ -114,31 +231,71 @@ def build_display(tasks_file: Path, state_file: Path | None, start_time: float) 
         header.append(f"  {counts['failed']} failed", style="red bold")
     header.append(f"\nElapsed: {format_duration(elapsed)}", style="dim")
 
-    # Running tasks table
-    running_table = Table(show_header=False, box=None, padding=(0, 1))
-    running_table.add_column("icon", width=2)
-    running_table.add_column("name", min_width=25)
-    running_table.add_column("model", width=8)
-    running_table.add_column("time", width=10, justify="right")
-    running_table.add_column("bar", width=10)
+    # Running tasks
+    running_table = Table(show_header=True, box=None, padding=(0, 1), header_style="dim")
+    running_table.add_column("", width=2)
+    running_table.add_column("Task", min_width=20, max_width=45)
+    running_table.add_column("Model", width=7)
+    running_table.add_column("Time", width=8, justify="right")
+    running_table.add_column("Output", width=7, justify="right")
+    running_table.add_column("Tools", width=5, justify="right")
+    running_table.add_column("Activity", min_width=20, max_width=40)
 
     for t in tasks:
         if t.get("status") != "running":
             continue
-        name = t.get("name", t.get("id", "?"))
+        tid = t.get("id", "?")
+        name = t.get("name", tid)
         model = t.get("model", "opus")
-        # Estimate elapsed from state task_starts or file mtime
+
         task_elapsed = "—"
-        bar = ""
-        if state and "started_at" in state:
-            # Use log file mtime as proxy for start
-            log_file = Path(state.get("log_dir", "")) / f"{t['id']}.stream.jsonl"
-            if log_file.exists():
-                t_start = log_file.stat().st_mtime
-                te = int(now - t_start)
-                task_elapsed = format_duration(te)
-                bar = make_progress_bar(te)
-        running_table.add_row("●", name, model, task_elapsed, bar, style="yellow")
+        output_size = "—"
+        tools_used = "—"
+        activity = ""
+
+        if log_dir:
+            stream_file = log_dir / f"{tid}.stream.jsonl"
+            output_file = log_dir / f"{tid}.output.md"
+
+            # Elapsed: use stream file creation time (birth time on macOS)
+            if stream_file.exists():
+                try:
+                    # Use birth time (st_birthtime on macOS) for true start
+                    t_start = getattr(stream_file.stat(), "st_birthtime", stream_file.stat().st_ctime)
+                    te = int(now - t_start)
+                    task_elapsed = format_duration(te)
+                except Exception:
+                    pass
+
+                # Output size
+                try:
+                    sz = stream_file.stat().st_size
+                    output_size = format_size(sz)
+                except Exception:
+                    pass
+
+                # Tool count
+                tc = count_tool_calls(stream_file)
+                if tc > 0:
+                    tools_used = str(tc)
+
+                # Last activity
+                activity = get_last_activity(stream_file)
+
+            # Also check .output.md size as alternative
+            if output_file.exists():
+                try:
+                    sz = output_file.stat().st_size
+                    if sz > 0:
+                        output_size = format_size(sz)
+                except Exception:
+                    pass
+
+        running_table.add_row(
+            spinner, name, model, task_elapsed, output_size, tools_used,
+            Text(activity, style="dim cyan", overflow="ellipsis", no_wrap=True),
+            style="yellow",
+        )
 
     # Recent completed
     recent_table = Table(show_header=False, box=None, padding=(0, 1))
@@ -147,12 +304,24 @@ def build_display(tasks_file: Path, state_file: Path | None, start_time: float) 
     recent_table.add_column("info", width=20)
 
     done_tasks = [t for t in tasks if t.get("status") in ("done", "failed")]
-    for t in done_tasks[-5:]:  # last 5
+    for t in done_tasks[-5:]:
         name = t.get("name", t.get("id", "?"))
+        tid = t.get("id", "?")
+        info = ""
+        if log_dir:
+            output_file = log_dir / f"{tid}.output.md"
+            if output_file.exists():
+                try:
+                    info = format_size(output_file.stat().st_size)
+                except Exception:
+                    pass
         if t["status"] == "done":
-            recent_table.add_row("✓", name, "", style="green")
+            recent_table.add_row("✓", name, info, style="green")
         else:
             recent_table.add_row("✗", name, "(failed)", style="red")
+
+    # Pending
+    pending_names = [t.get("name", t.get("id", "?")) for t in tasks if t.get("status") == "pending"]
 
     # Compose
     parts = [header, Text("")]
@@ -163,12 +332,15 @@ def build_display(tasks_file: Path, state_file: Path | None, start_time: float) 
     if done_tasks:
         parts.append(Text("RECENT", style="bold dim"))
         parts.append(recent_table)
+        parts.append(Text(""))
+    if pending_names:
+        parts.append(Text("QUEUED", style="bold dim"))
+        for pn in pending_names[:5]:
+            parts.append(Text(f"  ○ {pn}", style="dim"))
+        if len(pending_names) > 5:
+            parts.append(Text(f"  ... and {len(pending_names) - 5} more", style="dim"))
 
-    content = Text("\n").join(parts) if not (counts["running"] or done_tasks) else None
-    # Use renderables group
-    from rich.console import Group
     group = Group(*parts)
-
     return Panel(
         group,
         title="claude-fleet",
@@ -194,7 +366,14 @@ def main():
         with Live(build_display(tasks_file, state_file, start_time), console=console, refresh_per_second=0.5) as live:
             while True:
                 time.sleep(2)
-                live.update(build_display(tasks_file, state_file, start_time))
+                # Re-resolve state file each tick (it may appear after fleet starts)
+                sf = state_file
+                if not sf or not sf.exists():
+                    ld = find_log_dir(tasks_file)
+                    if ld:
+                        sf = ld / "state.json"
+                        state_file = sf
+                live.update(build_display(tasks_file, sf, start_time))
     except KeyboardInterrupt:
         pass
 
