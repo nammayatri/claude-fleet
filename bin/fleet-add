@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Add a single task to a tasks JSON file
+# Usage: fleet-add <id> <name> <workdir> <prompt> [model] [effort] [--file tasks.json]
+
+TASKS_FILE="tasks.json"
+
+# Parse --file flag
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --file) TASKS_FILE="$2"; shift 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+set -- "${args[@]}"
+
+if [[ $# -lt 4 ]]; then
+    echo "Usage: fleet-add <id> <name> <workdir> <prompt> [model=opus] [effort=high] [--file tasks.json]"
+    echo ""
+    echo "Example:"
+    echo "  fleet-add pr-review-456 'Review PR 456' /path/to/repo 'Review PR #456 for bugs'"
+    exit 1
+fi
+
+ID="$1"
+NAME="$2"
+WORKDIR="$3"
+PROMPT="$4"
+MODEL="${5:-opus}"
+EFFORT="${6:-high}"
+
+if [[ ! -f "$TASKS_FILE" ]]; then
+    echo '{"tasks":[]}' > "$TASKS_FILE"
+fi
+
+tmp=$(mktemp)
+jq --arg id "$ID" \
+   --arg name "$NAME" \
+   --arg workdir "$WORKDIR" \
+   --arg prompt "$PROMPT" \
+   --arg model "$MODEL" \
+   --arg effort "$EFFORT" \
+   '.tasks += [{"id":$id,"name":$name,"prompt":$prompt,"workdir":$workdir,"model":$model,"effort":$effort,"status":"pending"}]' \
+   "$TASKS_FILE" > "$tmp" && mv "$tmp" "$TASKS_FILE"
+
+echo "Added task: $NAME ($ID)"

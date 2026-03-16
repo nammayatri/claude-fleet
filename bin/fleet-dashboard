@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+claude-fleet TUI dashboard — real-time task monitoring.
+
+Usage:
+    fleet-dashboard <tasks.json>
+    fleet-dashboard <logs/run-dir/>
+
+Requires: pip install rich
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.columns import Columns
+except ImportError:
+    print("Missing dependency: pip install rich")
+    sys.exit(1)
+
+
+def find_files(arg: str):
+    """Resolve tasks file and optional state file from CLI arg."""
+    p = Path(arg)
+    if p.is_dir():
+        # Log directory mode — look for state.json and find tasks file
+        state_file = p / "state.json"
+        tasks_file = None
+        # Try to find tasks file from state
+        if state_file.exists():
+            state = json.loads(state_file.read_text())
+            # state.json doesn't store tasks file path, scan parent
+        # Fallback: look for any tasks*.json in parent dirs
+        for candidate in sorted(p.parent.glob("tasks*.json")):
+            tasks_file = candidate
+            break
+        return tasks_file, state_file if state_file.exists() else None
+    elif p.is_file() and p.suffix == ".json":
+        # Direct tasks file
+        log_dirs = sorted(Path(".").glob("logs/*/state.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+        state_file = log_dirs[0] if log_dirs else None
+        return p, state_file
+    else:
+        print(f"Not found: {arg}")
+        sys.exit(1)
+
+
+def load_tasks(tasks_file: Path) -> dict:
+    """Load tasks JSON, return dict with tasks list."""
+    try:
+        return json.loads(tasks_file.read_text())
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {"tasks": []}
+
+
+def load_state(state_file: Path | None) -> dict | None:
+    """Load state.json if available."""
+    if state_file and state_file.exists():
+        try:
+            return json.loads(state_file.read_text())
+        except (json.JSONDecodeError, FileNotFoundError):
+            return None
+    return None
+
+
+def format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
+def make_progress_bar(elapsed: int, width: int = 8) -> str:
+    """Simple time-based progress bar (caps at ~30 min)."""
+    max_time = 1800  # 30 min assumed max
+    filled = min(int((elapsed / max_time) * width), width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def build_display(tasks_file: Path, state_file: Path | None, start_time: float) -> Panel:
+    now = time.time()
+    data = load_tasks(tasks_file)
+    state = load_state(state_file)
+    tasks = data.get("tasks", [])
+
+    # Counts
+    counts = {"pending": 0, "running": 0, "done": 0, "failed": 0}
+    for t in tasks:
+        s = t.get("status", "pending")
+        counts[s] = counts.get(s, 0) + 1
+    total = len(tasks)
+
+    # Orchestrator start time
+    orch_start = state.get("started_at", start_time) if state else start_time
+    elapsed = int(now - orch_start)
+
+    # Header
+    header = Text()
+    header.append(f"Tasks: ", style="bold")
+    header.append(f"{counts['done']}/{total} done", style="green")
+    header.append(f"  {counts['running']} running", style="yellow")
+    header.append(f"  {counts['pending']} pending", style="dim")
+    if counts["failed"]:
+        header.append(f"  {counts['failed']} failed", style="red bold")
+    header.append(f"\nElapsed: {format_duration(elapsed)}", style="dim")
+
+    # Running tasks table
+    running_table = Table(show_header=False, box=None, padding=(0, 1))
+    running_table.add_column("icon", width=2)
+    running_table.add_column("name", min_width=25)
+    running_table.add_column("model", width=8)
+    running_table.add_column("time", width=10, justify="right")
+    running_table.add_column("bar", width=10)
+
+    for t in tasks:
+        if t.get("status") != "running":
+            continue
+        name = t.get("name", t.get("id", "?"))
+        model = t.get("model", "opus")
+        # Estimate elapsed from state task_starts or file mtime
+        task_elapsed = "—"
+        bar = ""
+        if state and "started_at" in state:
+            # Use log file mtime as proxy for start
+            log_file = Path(state.get("log_dir", "")) / f"{t['id']}.stream.jsonl"
+            if log_file.exists():
+                t_start = log_file.stat().st_mtime
+                te = int(now - t_start)
+                task_elapsed = format_duration(te)
+                bar = make_progress_bar(te)
+        running_table.add_row("●", name, model, task_elapsed, bar, style="yellow")
+
+    # Recent completed
+    recent_table = Table(show_header=False, box=None, padding=(0, 1))
+    recent_table.add_column("icon", width=2)
+    recent_table.add_column("name", min_width=25)
+    recent_table.add_column("info", width=20)
+
+    done_tasks = [t for t in tasks if t.get("status") in ("done", "failed")]
+    for t in done_tasks[-5:]:  # last 5
+        name = t.get("name", t.get("id", "?"))
+        if t["status"] == "done":
+            recent_table.add_row("✓", name, "", style="green")
+        else:
+            recent_table.add_row("✗", name, "(failed)", style="red")
+
+    # Compose
+    parts = [header, Text("")]
+    if counts["running"] > 0:
+        parts.append(Text("RUNNING", style="bold yellow"))
+        parts.append(running_table)
+        parts.append(Text(""))
+    if done_tasks:
+        parts.append(Text("RECENT", style="bold dim"))
+        parts.append(recent_table)
+
+    content = Text("\n").join(parts) if not (counts["running"] or done_tasks) else None
+    # Use renderables group
+    from rich.console import Group
+    group = Group(*parts)
+
+    return Panel(
+        group,
+        title="claude-fleet",
+        border_style="bold cyan",
+        padding=(1, 2),
+    )
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: fleet-dashboard <tasks.json | logs/run-dir/>")
+        sys.exit(1)
+
+    tasks_file, state_file = find_files(sys.argv[1])
+    if not tasks_file:
+        print(f"Could not find tasks file from: {sys.argv[1]}")
+        sys.exit(1)
+
+    console = Console()
+    start_time = time.time()
+
+    try:
+        with Live(build_display(tasks_file, state_file, start_time), console=console, refresh_per_second=0.5) as live:
+            while True:
+                time.sleep(2)
+                live.update(build_display(tasks_file, state_file, start_time))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

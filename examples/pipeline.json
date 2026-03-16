@@ -1,0 +1,22 @@
+{
+  "stages": [
+    {
+      "name": "Analyze",
+      "tasks": [
+        {"file": "tasks-audit.json", "max_parallel": 10}
+      ]
+    },
+    {
+      "name": "Fix",
+      "tasks": [
+        {"file": "tasks-fixes.json", "max_parallel": 5}
+      ]
+    },
+    {
+      "name": "Verify",
+      "tasks": [
+        {"file": "tasks-verify.json", "max_parallel": 5}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Reset all tasks back to pending
+TASKS_FILE="${1:-tasks.json}"
+
+if [[ ! -f "$TASKS_FILE" ]]; then
+    echo "File not found: $TASKS_FILE"
+    exit 1
+fi
+
+tmp=$(mktemp)
+jq '(.tasks[]).status = "pending"' "$TASKS_FILE" > "$tmp" && mv "$tmp" "$TASKS_FILE"
+echo "All tasks reset to pending."

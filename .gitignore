@@ -1,0 +1,9 @@
+logs/
+*.jsonl
+tasks-*.json
+!examples/*.json
+.mcp.json
+.DS_Store
+__pycache__/
+*.pyc
+fleet.conf

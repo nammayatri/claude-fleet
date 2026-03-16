@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Convert tasks markdown → tasks JSON
+# Format:
+#   ## Task Name
+#   - workdir: /path/to/repo
+#   - model: opus
+#   - effort: high
+#   - allowedTools: Read Grep Glob
+#   - appendSystemPrompt: extra instructions
+#
+#   Prompt text (everything until next ## or EOF)
+
+INPUT="${1:?Usage: fleet-convert <input.md> [output.json]}"
+OUTPUT="${2:-${INPUT%.md}.json}"
+
+if [[ ! -f "$INPUT" ]]; then
+    echo "File not found: $INPUT"
+    exit 1
+fi
+
+python3 -c "
+import re, json, sys
+
+with open('$INPUT') as f:
+    content = f.read()
+
+sections = re.split(r'^## ', content, flags=re.MULTILINE)[1:]
+
+tasks = []
+for section in sections:
+    lines = section.strip().split('\n')
+    name = lines[0].strip()
+    task_id = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+
+    meta = {}
+    prompt_lines = []
+    in_prompt = False
+
+    for line in lines[1:]:
+        stripped = line.strip()
+        if not in_prompt and re.match(r'^- \w+:', stripped):
+            key, val = stripped[2:].split(':', 1)
+            meta[key.strip()] = val.strip()
+        elif stripped == '':
+            if not in_prompt:
+                in_prompt = True
+            else:
+                prompt_lines.append('')
+        else:
+            in_prompt = True
+            prompt_lines.append(line)
+
+    prompt = '\n'.join(prompt_lines).strip()
+
+    task = {
+        'id': task_id,
+        'name': name,
+        'prompt': prompt,
+        'workdir': meta.get('workdir', '.'),
+        'model': meta.get('model', 'opus'),
+        'effort': meta.get('effort', 'high'),
+        'status': 'pending'
+    }
+
+    if 'allowedTools' in meta:
+        task['allowedTools'] = meta['allowedTools']
+    if 'appendSystemPrompt' in meta:
+        task['appendSystemPrompt'] = meta['appendSystemPrompt']
+
+    tasks.append(task)
+
+with open('$OUTPUT', 'w') as f:
+    json.dump({'tasks': tasks}, f, indent=2)
+
+print(f'Converted {len(tasks)} tasks → $OUTPUT')
+"
