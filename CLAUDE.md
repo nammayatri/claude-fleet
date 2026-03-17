@@ -20,6 +20,8 @@ bin/
 templates/
   ny-system-prompt.md    # appendSystemPrompt for NammaYatri tasks (MCP, architecture, ClickHouse)
   tasks-ny-audit.md      # Pre-built NY audit task templates
+  happy-system-prompt.md # appendSystemPrompt for Happy Coder tasks (monorepo, encryption, stack)
+  tasks-happy-audit.md   # Pre-built Happy Coder audit task templates
 examples/
   tasks-hello-world.md   # Example tasks
   pipeline.json          # Example multi-stage pipeline config
@@ -114,9 +116,11 @@ Quick single-task spawn:
 ```bash
 fleet-spawn "audit error handling" --ny --workdir ~/Documents/code/nammayatri --readonly
 fleet-spawn "fix logging in rider service" --ny --workdir ~/Documents/code/nammayatri
+fleet-spawn "audit encryption" --happy --workdir ~/happy --readonly
 ```
 
 The `--ny` flag automatically injects NammaYatri context (architecture, MCP instructions, ClickHouse tables) via `appendSystemPrompt`.
+The `--happy` flag automatically injects Happy Coder context (monorepo architecture, encryption, tech stack) via `appendSystemPrompt`.
 
 ## NammaYatri Templates
 
@@ -129,6 +133,25 @@ Copy and customize:
 cp templates/tasks-ny-audit.md tasks-my-audit.md
 # edit as needed
 fleet tasks-my-audit.md
+```
+
+## Happy Coder Templates
+
+Pre-built task templates for the Happy Coder project (mobile/web client for Claude Code):
+- `tasks-happy-audit.md` — 6 audit tasks (CLI security, server API security, app code quality, error handling, wire schema consistency, E2E encryption)
+- `happy-system-prompt.md` — shared context injected via `appendSystemPrompt`
+
+Copy and customize:
+```bash
+cp templates/tasks-happy-audit.md tasks-my-happy-audit.md
+# edit as needed
+fleet tasks-my-happy-audit.md
+```
+
+Quick spawn with Happy context:
+```bash
+fleet-spawn "audit encryption" --happy --workdir ~/happy --readonly
+fleet-spawn "fix error handling in server" --happy --workdir ~/happy/packages/happy-server
 ```
 
 ## Tips

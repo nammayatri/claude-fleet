@@ -5,9 +5,10 @@ set -euo pipefail
 # Creates a temporary task file and runs fleet on it
 #
 # Usage:
-#   fleet-spawn "prompt text" [--workdir DIR] [--model MODEL] [--name NAME] [--ny]
+#   fleet-spawn "prompt text" [--workdir DIR] [--model MODEL] [--name NAME] [--ny] [--happy]
 #
 # The --ny flag adds NammaYatri system prompt context automatically.
+# The --happy flag adds Happy Coder system prompt context automatically.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FLEET_DIR="$(dirname "$SCRIPT_DIR")"
@@ -18,6 +19,7 @@ MODEL="opus"
 EFFORT="high"
 NAME=""
 NY_MODE=false
+HAPPY_MODE=false
 ALLOWED_TOOLS="Read Grep Glob Bash Edit Write Agent"
 PROMPT=""
 
@@ -29,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --effort) EFFORT="$2"; shift 2 ;;
         --name) NAME="$2"; shift 2 ;;
         --ny) NY_MODE=true; shift ;;
+        --happy) HAPPY_MODE=true; shift ;;
         --tools) ALLOWED_TOOLS="$2"; shift 2 ;;
         --readonly) ALLOWED_TOOLS="Read Grep Glob Agent"; shift ;;
         --help|-h)
@@ -40,6 +43,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --effort LEVEL   Effort: high, medium, low (default: high)"
             echo "  --name NAME      Task name (auto-generated if omitted)"
             echo "  --ny             Add NammaYatri context (MCP instructions, architecture)"
+            echo "  --happy          Add Happy Coder context (monorepo architecture, encryption)"
             echo "  --tools TOOLS    Allowed tools (default: Read Grep Glob Bash Edit Write Agent)"
             echo "  --readonly       Shortcut for --tools 'Read Grep Glob Agent'"
             echo ""
@@ -47,6 +51,7 @@ while [[ $# -gt 0 ]]; do
             echo "  fleet-spawn 'Find all TODO comments' --workdir ~/code/nammayatri --readonly"
             echo "  fleet-spawn 'Fix error handling in rider service' --ny --workdir ~/code/nammayatri"
             echo "  fleet-spawn 'Audit API security' --ny --readonly"
+            echo "  fleet-spawn 'Audit encryption' --happy --workdir ~/happy --readonly"
             exit 0
             ;;
         *)
@@ -82,6 +87,18 @@ if $NY_MODE; then
         APPEND_PROMPT=$(cat "$NY_PROMPT_FILE")
     else
         echo "Warning: NY system prompt not found at $NY_PROMPT_FILE"
+    fi
+fi
+if $HAPPY_MODE; then
+    HAPPY_PROMPT_FILE="$FLEET_DIR/templates/happy-system-prompt.md"
+    if [[ -f "$HAPPY_PROMPT_FILE" ]]; then
+        if [[ -n "$APPEND_PROMPT" ]]; then
+            APPEND_PROMPT="$APPEND_PROMPT"$'\n\n'"$(cat "$HAPPY_PROMPT_FILE")"
+        else
+            APPEND_PROMPT=$(cat "$HAPPY_PROMPT_FILE")
+        fi
+    else
+        echo "Warning: Happy system prompt not found at $HAPPY_PROMPT_FILE"
     fi
 fi
 
