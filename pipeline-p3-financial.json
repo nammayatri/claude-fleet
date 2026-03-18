@@ -1,0 +1,24 @@
+{
+  "name": "P3 Financial Module Implementation Pipeline",
+  "description": "Multi-stage pipeline for implementing P3 Financial Module initiatives across nammayatri, control-center, and ny-react-native",
+  "stages": [
+    {
+      "name": "Stage 1: Foundation (Shared Kernel + Backend Specs)",
+      "description": "Create shared types and YAML specs first, as other stages depend on them",
+      "tasks_file": "tasks-p3-financial-stage1.md",
+      "max_parallel": 8
+    },
+    {
+      "name": "Stage 2: Backend Implementation",
+      "description": "Implement backend APIs and business logic after specs are ready",
+      "tasks_file": "tasks-p3-financial-stage2.md",
+      "max_parallel": 8
+    },
+    {
+      "name": "Stage 3: Frontend Implementation",
+      "description": "Implement control-center and provider app UIs after backend APIs exist",
+      "tasks_file": "tasks-p3-financial-stage3.md",
+      "max_parallel": 10
+    }
+  ]
+}
