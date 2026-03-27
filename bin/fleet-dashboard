@@ -301,6 +301,7 @@ def build_display(tasks_file: Path, state_file: Path | None, start_time: float) 
     recent_table = Table(show_header=False, box=None, padding=(0, 1))
     recent_table.add_column("icon", width=2)
     recent_table.add_column("name", min_width=25)
+    recent_table.add_column("score", width=6)
     recent_table.add_column("info", width=20)
 
     done_tasks = [t for t in tasks if t.get("status") in ("done", "failed")]
@@ -308,6 +309,7 @@ def build_display(tasks_file: Path, state_file: Path | None, start_time: float) 
         name = t.get("name", t.get("id", "?"))
         tid = t.get("id", "?")
         info = ""
+        score = t.get("score", "")
         if log_dir:
             output_file = log_dir / f"{tid}.output.md"
             if output_file.exists():
@@ -315,10 +317,11 @@ def build_display(tasks_file: Path, state_file: Path | None, start_time: float) 
                     info = format_size(output_file.stat().st_size)
                 except Exception:
                     pass
+        score_style = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}.get(score, "dim")
         if t["status"] == "done":
-            recent_table.add_row("✓", name, info, style="green")
+            recent_table.add_row("✓", name, Text(score, style=score_style), info, style="green")
         else:
-            recent_table.add_row("✗", name, "(failed)", style="red")
+            recent_table.add_row("✗", name, Text("FAIL", style="red"), "(failed)", style="red")
 
     # Pending
     pending_names = [t.get("name", t.get("id", "?")) for t in tasks if t.get("status") == "pending"]

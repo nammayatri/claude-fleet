@@ -68,6 +68,12 @@ for section in sections:
         task['allowedTools'] = meta['allowedTools']
     if 'appendSystemPrompt' in meta:
         task['appendSystemPrompt'] = meta['appendSystemPrompt']
+    if 'maxTokens' in meta:
+        task['maxTokens'] = int(meta['maxTokens'])
+    if 'taskType' in meta:
+        task['taskType'] = meta['taskType']
+    if 'allowedFiles' in meta:
+        task['allowedFiles'] = [f.strip() for f in meta['allowedFiles'].split(',')]
 
     tasks.append(task)
 

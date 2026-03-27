@@ -16,6 +16,7 @@ bin/
   fleet-reset        # Resets all tasks to pending
   fleet-pipeline     # Multi-stage pipeline runner (sequential stages, parallel tasks)
   fleet-dashboard    # Real-time TUI dashboard (Python + rich)
+  fleet-validate     # Post-run quality scoring (PASS/WARN/FAIL)
   fleet-spawn        # Quick single-task launcher (with --ny flag for NammaYatri context)
 templates/
   ny-system-prompt.md    # appendSystemPrompt for NammaYatri tasks (MCP, architecture, ClickHouse)
@@ -47,6 +48,9 @@ examples/
 - effort: high
 - allowedTools: Read Grep Glob Bash Edit Write Agent
 - appendSystemPrompt: Optional extra instructions
+- maxTokens: 50000
+- taskType: fix
+- allowedFiles: src/worker.js, src/utils.js
 
 Prompt text here. Everything until the next ## heading.
 ```
@@ -66,12 +70,28 @@ Convert: `fleet-convert tasks.md tasks.json`
     "effort": "high",
     "status": "pending",
     "allowedTools": "Read Grep Glob Bash",
-    "appendSystemPrompt": "Optional"
+    "appendSystemPrompt": "Optional",
+    "maxTokens": 50000,
+    "taskType": "fix",
+    "allowedFiles": ["src/worker.js", "src/utils.js"]
   }]
 }
 ```
 
 Status values: `pending` → `running` → `done` | `failed`
+
+## Anti-Junk Framework
+
+Fleet includes 6 guardrails to prevent junk output:
+
+1. **Token budget** — `maxTokens` per task (defaults: 50k fix, 30k audit, 15k verify). 80% warning, 95% force-stop.
+2. **Scope lock** — `allowedFiles` field; `.fleet-lock` written per task; violations flagged post-completion.
+3. **Checkpoint commits** — Auto WIP commit at 50% budget for tasks >30k tokens.
+4. **Quality scoring** — PASS/WARN/FAIL per task (output size, scope violations, diff size). Shown in dashboard.
+5. **Anti-wandering prompt** — Auto-prepended to every task: stay focused, no unnecessary reads/refactors.
+6. **Conflict detection** — Overlapping `allowedFiles` → tasks run sequentially, not parallel.
+
+Post-run: `fleet-validate tasks.json [log-dir]`
 
 ## Running
 
