@@ -98,6 +98,8 @@ Fleet installs global slash commands so you can orchestrate fleets **from within
 - allowedFiles: src/worker.js, src/utils.js
 - stage: 1
 - maxTurns: 10
+- dependsOn: task-a, task-b
+- autoVerify: true
 
 Prompt text here. Everything until the next ## heading.
 ```
@@ -121,7 +123,9 @@ Prompt text here. Everything until the next ## heading.
       "taskType": "fix",
       "allowedFiles": ["src/worker.js", "src/utils.js"],
       "stage": 1,
-      "maxTurns": 10
+      "maxTurns": 10,
+      "dependsOn": ["task-a", "task-b"],
+      "autoVerify": true
     }
   ]
 }
@@ -136,6 +140,8 @@ Prompt text here. Everything until the next ## heading.
 | `allowedFiles` | array/csv | — | Files the task is allowed to modify. Violations are flagged. Overlapping scopes between tasks trigger sequential execution. Pre-flight warns if any target file is >500 lines. |
 | `stage` | number | — | Execution stage (1, 2, 3...). All tasks in stage N must complete before stage N+1 starts. Use to ensure verification runs after fixes. |
 | `maxTurns` | number | — | Max tool-use rounds for the agent. Limits how many actions the agent can take. |
+| `dependsOn` | string/array | — | Task ID(s) that must complete before this task starts. Supports DAG graphs. Upstream outputs are auto-forwarded to this task's prompt. |
+| `autoVerify` | boolean | `false` | Auto-generates a read-only verification task that runs after this task completes. |
 
 ## Configuration
 
@@ -240,7 +246,34 @@ Fleet includes guardrails to prevent low-quality output from parallel tasks:
 
 9. **Max turns** — `maxTurns` field passes `--max-turns` to the Claude CLI, hard-limiting how many tool-use rounds an agent can take. Combine with `maxTokens` for double-layered wandering prevention.
 
+10. **DAG dependencies** — `dependsOn` supports arrays (`["task-a", "task-b"]`) for multi-parent task graphs. Tasks wait for all parents to complete.
+
+11. **Output forwarding** — When a task has `dependsOn`, the outputs from upstream tasks are automatically injected into the downstream task's prompt (last 2000 chars per upstream). Downstream tasks can build on findings from earlier tasks.
+
+12. **Auto-verify** — Set `autoVerify: true` on any fix task. Fleet auto-generates a read-only verification task that runs after the fix completes, checking for compilation errors, minimal diffs, and test regressions.
+
 Run `fleet-validate tasks.json` after a fleet run for a detailed quality report.
+
+### Example: DAG with output forwarding
+
+```markdown
+## Audit auth module
+- stage: 1
+- taskType: audit
+- allowedTools: Read Grep Glob
+
+Find all security issues in the auth module.
+
+## Fix auth issues
+- stage: 2
+- dependsOn: audit-auth-module
+- autoVerify: true
+- allowedFiles: src/auth.js
+
+Fix the issues found by the audit. (Upstream audit output is auto-injected here.)
+```
+
+The verify task is auto-generated — no need to write it manually.
 
 ### Recommended task design
 
@@ -248,6 +281,8 @@ Run `fleet-validate tasks.json` after a fleet run for a detailed quality report.
 - **Split large files first** — agents handle 200-line files, not 2500-line monoliths
 - **Use stages** — `stage: 1` for fixes, `stage: 2` for verification
 - **Set `allowedFiles`** — enables conflict detection, scope checking, and large file warnings
+- **Use `autoVerify: true`** — every fix gets a free verification pass
+- **Use `dependsOn`** — build task DAGs where downstream tasks receive upstream outputs
 
 ## Tips
 

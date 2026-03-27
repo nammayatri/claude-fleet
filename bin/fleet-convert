@@ -78,6 +78,11 @@ for section in sections:
         task['stage'] = int(meta['stage'])
     if 'maxTurns' in meta:
         task['maxTurns'] = int(meta['maxTurns'])
+    if 'dependsOn' in meta:
+        deps = [d.strip() for d in meta['dependsOn'].split(',')]
+        task['dependsOn'] = deps if len(deps) > 1 else deps[0]
+    if 'autoVerify' in meta:
+        task['autoVerify'] = meta['autoVerify'].lower() in ('true', 'yes', '1')
 
     tasks.append(task)
 
