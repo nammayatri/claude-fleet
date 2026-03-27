@@ -1,0 +1,22 @@
+default:
+  just --list
+
+# Install dependencies
+install:
+  bun install
+
+# Type check
+check:
+  bun x tsc --noEmit
+
+# Run a workflow
+run file *args:
+  bun run src/cli.ts run {{file}} {{args}}
+
+# Validate a workflow file
+validate file:
+  bun run src/cli.ts validate {{file}}
+
+# Run the hello-world example
+hello task="write a hello world in TypeScript":
+  bun run src/cli.ts run workflows/hello-world.yaml "{{task}}" --verbose

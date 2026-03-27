@@ -1,0 +1,24 @@
+name: hello-world
+start: plan
+
+nodes:
+  plan:
+    prompt: |
+      Analyze the task and create a brief implementation plan.
+      List the files to change, the approach, and any edge cases.
+      Do NOT implement anything — only plan.
+    model: sonnet
+    tools: [Read, Grep, Glob]
+
+  execute:
+    prompt: |
+      Implement the changes based on the plan from the previous step.
+      If there is feedback from upstream (refactoring suggestions or CI failures),
+      address those specifically.
+      Make minimal, correct changes.
+    model: sonnet
+    tools: [Read, Grep, Glob, Bash, Edit, Write]
+
+edges:
+  - "plan -> execute"
+  - "execute -> done"

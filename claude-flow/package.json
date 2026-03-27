@@ -1,0 +1,16 @@
+{
+  "name": "claude-flow",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "claude-flow": "src/cli.ts"
+  },
+  "dependencies": {
+    "xstate": "^5",
+    "yaml": "^2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
