@@ -51,6 +51,8 @@ examples/
 - maxTokens: 50000
 - taskType: fix
 - allowedFiles: src/worker.js, src/utils.js
+- stage: 1
+- maxTurns: 10
 
 Prompt text here. Everything until the next ## heading.
 ```
@@ -73,7 +75,9 @@ Convert: `fleet-convert tasks.md tasks.json`
     "appendSystemPrompt": "Optional",
     "maxTokens": 50000,
     "taskType": "fix",
-    "allowedFiles": ["src/worker.js", "src/utils.js"]
+    "allowedFiles": ["src/worker.js", "src/utils.js"],
+    "stage": 1,
+    "maxTurns": 10
   }]
 }
 ```
@@ -88,8 +92,11 @@ Fleet includes 6 guardrails to prevent junk output:
 2. **Scope lock** — `allowedFiles` field; `.fleet-lock` written per task; violations flagged post-completion.
 3. **Checkpoint commits** — Auto WIP commit at 50% budget for tasks >30k tokens.
 4. **Quality scoring** — PASS/WARN/FAIL per task (output size, scope violations, diff size). Shown in dashboard.
-5. **Anti-wandering prompt** — Auto-prepended to every task: stay focused, no unnecessary reads/refactors.
+5. **Anti-wandering prompt** — Aggressive 8-rule constraint list prepended to every task prompt.
 6. **Conflict detection** — Overlapping `allowedFiles` → tasks run sequentially, not parallel.
+7. **Large file warnings** — Pre-flight check warns when `allowedFiles` targets files >500 lines.
+8. **Stage ordering** — `stage` field (1, 2, 3...) ensures verification tasks wait for fixes to complete.
+9. **Max turns** — `maxTurns` field limits agent tool-use rounds to prevent wandering.
 
 Post-run: `fleet-validate tasks.json [log-dir]`
 
