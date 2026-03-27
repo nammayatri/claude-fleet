@@ -7,3 +7,4 @@ tasks-*.json
 __pycache__/
 *.pyc
 fleet.conf
+result

@@ -2,13 +2,33 @@
 
 A parallel task orchestrator for running hundreds of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions concurrently. Maximize your Claude Max subscription by running audit, fix, and verification tasks in parallel batches.
 
-## Quick Start
+## Install
+
+### Nix (recommended)
 
 ```bash
-# Install
+# Run fleet (default program)
+nix run github:nammayatri/claude-fleet -- tasks.json
+
+# Run other scripts
+nix shell github:nammayatri/claude-fleet -c fleet-dashboard tasks.json
+nix shell github:nammayatri/claude-fleet -c fleet-spawn "audit error handling"
+
+# Or install all scripts to profile
+nix profile install github:nammayatri/claude-fleet
+```
+
+### Manual
+
+```bash
 git clone https://github.com/nammayatri/claude-fleet.git
 cd claude-fleet
 ./install.sh  # symlinks to ~/.local/bin
+```
+
+## Quick Start
+
+```bash
 
 # Create tasks
 cat > tasks.md << 'EOF'
