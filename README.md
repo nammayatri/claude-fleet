@@ -96,6 +96,8 @@ Fleet installs global slash commands so you can orchestrate fleets **from within
 - maxTokens: 50000
 - taskType: fix
 - allowedFiles: src/worker.js, src/utils.js
+- stage: 1
+- maxTurns: 10
 
 Prompt text here. Everything until the next ## heading.
 ```
@@ -117,7 +119,9 @@ Prompt text here. Everything until the next ## heading.
       "appendSystemPrompt": "Optional",
       "maxTokens": 50000,
       "taskType": "fix",
-      "allowedFiles": ["src/worker.js", "src/utils.js"]
+      "allowedFiles": ["src/worker.js", "src/utils.js"],
+      "stage": 1,
+      "maxTurns": 10
     }
   ]
 }
@@ -129,7 +133,9 @@ Prompt text here. Everything until the next ## heading.
 |-------|------|---------|-------------|
 | `maxTokens` | number | 50k (fix), 30k (audit), 15k (verify) | Token budget per task. At 80% a warning is logged; at 95% the task is force-stopped. |
 | `taskType` | string | `fix` | Task category: `fix`, `audit`, `review`, `verify`, `check`. Determines default token budget. |
-| `allowedFiles` | array/csv | — | Files the task is allowed to modify. Violations are flagged. Overlapping scopes between tasks trigger sequential execution. |
+| `allowedFiles` | array/csv | — | Files the task is allowed to modify. Violations are flagged. Overlapping scopes between tasks trigger sequential execution. Pre-flight warns if any target file is >500 lines. |
+| `stage` | number | — | Execution stage (1, 2, 3...). All tasks in stage N must complete before stage N+1 starts. Use to ensure verification runs after fixes. |
+| `maxTurns` | number | — | Max tool-use rounds for the agent. Limits how many actions the agent can take. |
 
 ## Configuration
 
@@ -224,11 +230,24 @@ Fleet includes guardrails to prevent low-quality output from parallel tasks:
 
 4. **Output quality scoring** — Every completed task is scored PASS/WARN/FAIL based on: output existence, stream size (wandering detection), scope violations, and diff size (<500 lines expected). Scores show in the dashboard and summary.
 
-5. **Anti-wandering prompt injection** — Every task prompt is automatically prefixed with scope-limiting instructions telling the agent to stay focused, avoid unnecessary reads, and not refactor surrounding code.
+5. **Anti-wandering prompt injection** — Every task prompt is prefixed with an aggressive 8-rule constraint list: no unnecessary reads, no refactoring, no comments on unchanged lines, smallest correct change wins.
 
 6. **Conflict detection** — Before launch, tasks with overlapping `allowedFiles` are detected and run sequentially instead of in parallel, preventing merge conflicts.
 
+7. **Large file warnings** — Pre-flight check scans `allowedFiles` and warns when any target file exceeds 500 lines. Agents handle 200-line files well but struggle with monoliths — split large files before running fleet.
+
+8. **Stage ordering** — Add `stage: 1` / `stage: 2` to tasks in a single file. All stage-1 tasks must complete before stage-2 starts. No more verification tasks running in parallel with fixes.
+
+9. **Max turns** — `maxTurns` field passes `--max-turns` to the Claude CLI, hard-limiting how many tool-use rounds an agent can take. Combine with `maxTokens` for double-layered wandering prevention.
+
 Run `fleet-validate tasks.json` after a fleet run for a detailed quality report.
+
+### Recommended task design
+
+- **One feature per task, one file per task** — never two tasks editing the same file in parallel
+- **Split large files first** — agents handle 200-line files, not 2500-line monoliths
+- **Use stages** — `stage: 1` for fixes, `stage: 2` for verification
+- **Set `allowedFiles`** — enables conflict detection, scope checking, and large file warnings
 
 ## Tips
 

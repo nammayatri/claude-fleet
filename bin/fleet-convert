@@ -74,6 +74,10 @@ for section in sections:
         task['taskType'] = meta['taskType']
     if 'allowedFiles' in meta:
         task['allowedFiles'] = [f.strip() for f in meta['allowedFiles'].split(',')]
+    if 'stage' in meta:
+        task['stage'] = int(meta['stage'])
+    if 'maxTurns' in meta:
+        task['maxTurns'] = int(meta['maxTurns'])
 
     tasks.append(task)
 

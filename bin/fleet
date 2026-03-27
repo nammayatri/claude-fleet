@@ -102,9 +102,43 @@ if [[ ! -f "$TASKS_FILE" ]]; then
     exit 1
 fi
 
+# ─── Pre-flight checks ───
+# Warn about large files that tasks will target
+preflight_large_file_check() {
+    local warned=false
+    while IFS= read -r task_json; do
+        [[ -z "$task_json" ]] && continue
+        local tid=$(echo "$task_json" | jq -r '.id')
+        local workdir=$(echo "$task_json" | jq -r '.workdir // "."')
+        workdir="${workdir/#\~/$HOME}"
+        local files=$(echo "$task_json" | jq -r '.allowedFiles // [] | if type == "array" then .[] else empty end' 2>/dev/null)
+        [[ -z "$files" ]] && continue
+
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            local full_path="$workdir/$file"
+            [[ ! -f "$full_path" ]] && continue
+            local lines=$(wc -l < "$full_path" 2>/dev/null | tr -d ' ')
+            if [[ $lines -gt 500 ]]; then
+                log "${YELLOW}⚠ Large file:${NC} $file (${lines} lines) targeted by task ${BLUE}$tid${NC} — agents struggle with files >500 lines. Consider splitting."
+                warned=true
+            fi
+        done <<< "$files"
+    done < <(jq -c '.tasks[] | select(.status == "pending")' "$TASKS_FILE")
+    $warned && echo ""
+}
+
 # ─── Anti-wandering prompt prefix ───
 # Prepended to every task prompt to keep agents focused
-ANTI_WANDER_PREFIX="IMPORTANT: You have a focused scope. Do NOT read files unless directly needed for your task. Do NOT refactor surrounding code. Do NOT add comments to unchanged lines. If you're unsure whether something is in scope, it isn't. Be concise and direct — finish your task with minimal token usage."
+ANTI_WANDER_PREFIX="CRITICAL CONSTRAINTS — read before starting:
+1. You have ONE focused task. Do NOT explore beyond what's directly needed.
+2. Do NOT read files unless they are directly required for your change.
+3. Do NOT refactor, improve, or clean up surrounding code.
+4. Do NOT add comments, docstrings, or type annotations to unchanged lines.
+5. Do NOT add error handling or validation beyond what's asked.
+6. If you're unsure whether something is in scope, it ISN'T — skip it.
+7. Make your change, verify it works, commit, and stop.
+8. Prefer the SMALLEST correct change over a thorough one."
 
 # ─── Conflict detection (mechanism 6) ───
 # Check for overlapping allowedFiles across pending tasks
@@ -157,9 +191,17 @@ log "Mode: ${BLUE}$MODE${NC}"
 log "CLI: ${BLUE}$CLAUDE_CMD${NC}"
 log "Logs: ${BLUE}$LOG_DIR${NC}"
 
-# Run conflict detection
+# Run pre-flight checks
+preflight_large_file_check
 if detect_conflicts 2>/dev/null; then
     log "Conflict detection adjusted task ordering"
+fi
+
+# Check for stage-based ordering
+HAS_STAGES=$(jq '[.tasks[] | select(.stage != null)] | length' "$TASKS_FILE" 2>/dev/null || echo "0")
+if [[ $HAS_STAGES -gt 0 ]]; then
+    STAGES=$(jq -r '[.tasks[] | .stage // 0] | unique | sort | .[]' "$TASKS_FILE" 2>/dev/null)
+    log "Stage-based ordering: stages $(echo $STAGES | tr '\n' ' ')"
 fi
 echo ""
 
@@ -363,6 +405,7 @@ launch_task() {
     local max_tokens=$(echo "$task_json" | jq -r '.maxTokens // ""')
     local task_type=$(echo "$task_json" | jq -r '.taskType // "fix"')
     local allowed_files=$(echo "$task_json" | jq -c '.allowedFiles // []')
+    local max_turns=$(echo "$task_json" | jq -r '.maxTurns // ""')
 
     local log_file="$LOG_DIR/${id}.log"
     local out_file="$LOG_DIR/${id}.output.md"
@@ -395,6 +438,9 @@ $append_prompt}"
     fi
     if [[ -n "$append_prompt" ]]; then
         cmd+=(--append-system-prompt "$append_prompt")
+    fi
+    if [[ -n "$max_turns" && "$max_turns" != "null" ]]; then
+        cmd+=(--max-turns "$max_turns")
     fi
 
     (
@@ -546,15 +592,27 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ─── Check if a task's dependencies are satisfied (mechanism 6) ───
+# ─── Check if a task's dependencies are satisfied ───
 is_task_ready() {
     local task_json="$1"
-    local depends_on=$(echo "$task_json" | jq -r '.dependsOn // ""')
-    [[ -z "$depends_on" || "$depends_on" == "null" ]] && return 0
 
-    local dep_status=$(jq -r --arg id "$depends_on" '.tasks[] | select(.id == $id) | .status' "$TASKS_FILE" 2>/dev/null)
-    [[ "$dep_status" == "done" ]] && return 0
-    return 1
+    # Check explicit dependsOn (from conflict detection)
+    local depends_on=$(echo "$task_json" | jq -r '.dependsOn // ""')
+    if [[ -n "$depends_on" && "$depends_on" != "null" ]]; then
+        local dep_status=$(jq -r --arg id "$depends_on" '.tasks[] | select(.id == $id) | .status' "$TASKS_FILE" 2>/dev/null)
+        [[ "$dep_status" != "done" ]] && return 1
+    fi
+
+    # Check stage ordering: all tasks in earlier stages must be done/failed
+    local task_stage=$(echo "$task_json" | jq -r '.stage // ""')
+    if [[ -n "$task_stage" && "$task_stage" != "null" && "$task_stage" != "0" ]]; then
+        local earlier_incomplete=$(jq --argjson stage "$task_stage" \
+            '[.tasks[] | select((.stage // 0) < $stage and (.status == "pending" or .status == "running"))] | length' \
+            "$TASKS_FILE" 2>/dev/null || echo "0")
+        [[ $earlier_incomplete -gt 0 ]] && return 1
+    fi
+
+    return 0
 }
 
 # Main loop
