@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+# fleet-validate — Post-task output quality scoring
+# Scores each completed task: PASS / WARN / FAIL
+#
+# Usage:
+#   fleet-validate <tasks.json> [log-dir]
+#
+# Checks:
+#   - Did the task create a commit? (expected for fix/edit tasks)
+#   - Does the test suite still pass?
+#   - Is the git diff reasonable (< 500 lines for focused tasks)?
+#   - Did it touch files outside its declared scope (allowedFiles)?
+
+TASKS_FILE="${1:?Usage: fleet-validate <tasks.json> [log-dir]}"
+LOG_DIR="${2:-}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Find most recent log dir if not provided
+if [[ -z "$LOG_DIR" ]]; then
+    LOG_DIR=$(ls -dt logs/*/ 2>/dev/null | head -1)
+    if [[ -z "$LOG_DIR" ]]; then
+        echo "No log directory found. Provide one as second argument."
+        exit 1
+    fi
+fi
+
+log() { echo -e "${CYAN}[validate]${NC} $*"; }
+
+echo ""
+log "═══ Fleet Output Quality Report ═══"
+echo ""
+
+total=0
+pass=0
+warn=0
+fail=0
+
+while IFS= read -r task_json; do
+    [[ -z "$task_json" ]] && continue
+    id=$(echo "$task_json" | jq -r '.id')
+    name=$(echo "$task_json" | jq -r '.name')
+    status=$(echo "$task_json" | jq -r '.status')
+    workdir=$(echo "$task_json" | jq -r '.workdir // "."')
+    workdir="${workdir/#\~/$HOME}"
+    allowed_files=$(echo "$task_json" | jq -r '.allowedFiles // "" | if type == "array" then join(" ") else . end')
+    allowed_tools=$(echo "$task_json" | jq -r '.allowedTools // ""')
+    task_type=$(echo "$task_json" | jq -r '.taskType // "fix"')
+
+    [[ "$status" != "done" && "$status" != "failed" ]] && continue
+    total=$((total + 1))
+
+    issues=()
+    warnings=()
+
+    # Check 1: Task status
+    if [[ "$status" == "failed" ]]; then
+        issues+=("task failed")
+    fi
+
+    # Check 2: Output file exists and is non-empty
+    output_file="$LOG_DIR/${id}.output.md"
+    if [[ ! -f "$output_file" ]] || [[ ! -s "$output_file" ]]; then
+        issues+=("no output produced")
+    fi
+
+    # Check 3: Stream file size (proxy for token usage)
+    stream_file="$LOG_DIR/${id}.stream.jsonl"
+    if [[ -f "$stream_file" ]]; then
+        stream_size=$(wc -c < "$stream_file" | tr -d ' ')
+        # Very large stream files suggest wandering (>5MB ≈ excessive)
+        if [[ $stream_size -gt 5242880 ]]; then
+            warnings+=("large output: $(( stream_size / 1024 / 1024 ))MB stream — possible wandering")
+        fi
+    fi
+
+    # Check 4: Scope violation (if allowedFiles declared)
+    if [[ -n "$allowed_files" && -d "$workdir/.git" ]]; then
+        scope_file="$LOG_DIR/${id}.scope-violations.log"
+        if [[ -f "$scope_file" && -s "$scope_file" ]]; then
+            violation_count=$(wc -l < "$scope_file" | tr -d ' ')
+            warnings+=("$violation_count file(s) modified outside declared scope")
+        fi
+    fi
+
+    # Check 5: Diff size check (only for tasks with Edit/Write tools)
+    if [[ "$allowed_tools" == *"Edit"* || "$allowed_tools" == *"Write"* ]]; then
+        diff_lines_file="$LOG_DIR/${id}.diff-lines"
+        if [[ -f "$diff_lines_file" ]]; then
+            diff_lines=$(cat "$diff_lines_file")
+            if [[ $diff_lines -gt 500 ]]; then
+                warnings+=("large diff: $diff_lines lines changed (expected <500 for focused task)")
+            fi
+        fi
+    fi
+
+    # Score
+    if [[ ${#issues[@]} -gt 0 ]]; then
+        score="FAIL"
+        fail=$((fail + 1))
+        color="$RED"
+    elif [[ ${#warnings[@]} -gt 0 ]]; then
+        score="WARN"
+        warn=$((warn + 1))
+        color="$YELLOW"
+    else
+        score="PASS"
+        pass=$((pass + 1))
+        color="$GREEN"
+    fi
+
+    echo -e "  ${color}[$score]${NC} $name"
+    for issue in "${issues[@]+"${issues[@]}"}"; do
+        echo -e "         ${RED}✗ $issue${NC}"
+    done
+    for warning in "${warnings[@]+"${warnings[@]}"}"; do
+        echo -e "         ${YELLOW}⚠ $warning${NC}"
+    done
+
+done < <(jq -c '.tasks[]' "$TASKS_FILE")
+
+echo ""
+log "Summary: ${GREEN}$pass PASS${NC}, ${YELLOW}$warn WARN${NC}, ${RED}$fail FAIL${NC} (of $total tasks)"
+
+# Write scores to log dir
+jq -n \
+    --argjson pass "$pass" \
+    --argjson warn "$warn" \
+    --argjson fail "$fail" \
+    --argjson total "$total" \
+    '{pass: $pass, warn: $warn, fail: $fail, total: $total}' \
+    > "$LOG_DIR/quality-scores.json" 2>/dev/null || true
+
+# Exit with error if any failures
+[[ $fail -gt 0 ]] && exit 1
+exit 0

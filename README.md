@@ -45,6 +45,8 @@ fleet-dashboard tasks.json
 
 ## Commands
 
+### CLI
+
 | Command | Description |
 |---------|-------------|
 | `fleet <tasks.json>` | Run tasks in parallel |
@@ -53,6 +55,32 @@ fleet-dashboard tasks.json
 | `fleet-reset <tasks.json>` | Reset all tasks to pending |
 | `fleet-pipeline <pipeline.json>` | Run multi-stage pipeline |
 | `fleet-dashboard <tasks.json>` | Real-time TUI dashboard |
+| `fleet-validate <tasks.json> [log-dir]` | Post-run quality report (PASS/WARN/FAIL) |
+| `fleet-spawn <prompt>` | Quick single-task launcher |
+
+### Claude Code Slash Commands
+
+Fleet installs global slash commands so you can orchestrate fleets **from within any Claude Code session** — no terminal switching, no context loss:
+
+| Command | What it does |
+|---------|-------------|
+| `/fleet <tasks-file-or-description>` | Spawn a fleet of parallel Claude sessions. Pass a task file path to run immediately, or describe what you want in natural language and fleet creates the tasks for you. |
+| `/fleet-task <description>` | Create task files from a prompt. Describe what you need ("audit all NY repos for error handling") and it generates properly formatted task markdown with workdirs, models, tools, and detailed prompts. |
+| `/fleet-status [tasks-file]` | Check running fleet status without leaving your session. Shows done/running/pending/failed counts, active task details, and recent completions. |
+
+**Why this matters:** You stay in your Claude session doing focused work while fleet runs 10-30 parallel sessions in the background. Check status, spawn new fleets, create tasks — all without opening a terminal. The AI understands your codebase context and generates better task prompts than you'd write manually.
+
+```
+# Inside any Claude Code session:
+> /fleet-task "audit payment, booking, and allocation services for error handling"
+  → Creates tasks-audit-services.md with 3 focused tasks
+
+> /fleet tasks-audit-services.md
+  → Spawns 3 parallel Claude sessions, runs in background
+
+> /fleet-status
+  → Fleet Status: 1/3 done | 2 running | 0 pending | 0 failed
+```
 
 ## Task Format (Markdown)
 
@@ -65,6 +93,9 @@ fleet-dashboard tasks.json
 - effort: high
 - allowedTools: Read Grep Glob Bash Edit Write Agent
 - appendSystemPrompt: Optional extra instructions
+- maxTokens: 50000
+- taskType: fix
+- allowedFiles: src/worker.js, src/utils.js
 
 Prompt text here. Everything until the next ## heading.
 ```
@@ -83,11 +114,22 @@ Prompt text here. Everything until the next ## heading.
       "effort": "high",
       "status": "pending",
       "allowedTools": "Read Grep Glob Bash",
-      "appendSystemPrompt": "Optional"
+      "appendSystemPrompt": "Optional",
+      "maxTokens": 50000,
+      "taskType": "fix",
+      "allowedFiles": ["src/worker.js", "src/utils.js"]
     }
   ]
 }
 ```
+
+### Anti-Junk Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `maxTokens` | number | 50k (fix), 30k (audit), 15k (verify) | Token budget per task. At 80% a warning is logged; at 95% the task is force-stopped. |
+| `taskType` | string | `fix` | Task category: `fix`, `audit`, `review`, `verify`, `check`. Determines default token budget. |
+| `allowedFiles` | array/csv | — | Files the task is allowed to modify. Violations are flagged. Overlapping scopes between tasks trigger sequential execution. |
 
 ## Configuration
 
@@ -170,12 +212,42 @@ logs/
     state.json               # live status for dashboard
 ```
 
+## Anti-Junk Framework
+
+Fleet includes guardrails to prevent low-quality output from parallel tasks:
+
+1. **Token budget enforcement** — Each task has a `maxTokens` budget (default: 50k for fixes, 30k for audits, 15k for verification). At 80% usage a warning is logged. At 95% the task is force-stopped and partial output saved.
+
+2. **Scope lock files** — Tasks with `allowedFiles` write a `.fleet-lock` in the workdir. After completion, git diff is checked against the allowed list and violations are flagged.
+
+3. **Checkpoint commits** — Tasks with >30k token budgets get an automatic `WIP: [task-name] checkpoint` commit at 50% budget usage, preventing total loss if the agent derails.
+
+4. **Output quality scoring** — Every completed task is scored PASS/WARN/FAIL based on: output existence, stream size (wandering detection), scope violations, and diff size (<500 lines expected). Scores show in the dashboard and summary.
+
+5. **Anti-wandering prompt injection** — Every task prompt is automatically prefixed with scope-limiting instructions telling the agent to stay focused, avoid unnecessary reads, and not refactor surrounding code.
+
+6. **Conflict detection** — Before launch, tasks with overlapping `allowedFiles` are detected and run sequentially instead of in parallel, preventing merge conflicts.
+
+Run `fleet-validate tasks.json` after a fleet run for a detailed quality report.
+
 ## Tips
 
 - Read-only tasks: omit `Edit Write` from allowedTools for safety
 - Multiple orchestrators: run several `fleet` instances with different task files
 - Background: `MAX_PARALLEL=10 fleet tasks.json > /tmp/fleet.log 2>&1 &`
 - Reset stuck tasks: `fleet-reset tasks.json`
+
+## Updating
+
+If you've already installed claude-fleet, pull the latest and re-run the installer:
+
+```bash
+cd /path/to/claude-fleet
+git pull
+./install.sh  # re-symlinks all bin/* scripts
+```
+
+Since install uses symlinks, `git pull` alone updates the scripts. Re-running `./install.sh` is only needed when new commands are added (like `fleet-validate`).
 
 ## Requirements
 

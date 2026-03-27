@@ -102,6 +102,52 @@ if [[ ! -f "$TASKS_FILE" ]]; then
     exit 1
 fi
 
+# ─── Anti-wandering prompt prefix ───
+# Prepended to every task prompt to keep agents focused
+ANTI_WANDER_PREFIX="IMPORTANT: You have a focused scope. Do NOT read files unless directly needed for your task. Do NOT refactor surrounding code. Do NOT add comments to unchanged lines. If you're unsure whether something is in scope, it isn't. Be concise and direct — finish your task with minimal token usage."
+
+# ─── Conflict detection (mechanism 6) ───
+# Check for overlapping allowedFiles across pending tasks
+detect_conflicts() {
+    local conflicts_found=false
+    local -a task_ids=()
+    local -A task_files_map=()
+
+    while IFS= read -r task_json; do
+        [[ -z "$task_json" ]] && continue
+        local tid=$(echo "$task_json" | jq -r '.id')
+        local files=$(echo "$task_json" | jq -r '.allowedFiles // [] | if type == "array" then .[] else empty end' 2>/dev/null)
+        [[ -z "$files" ]] && continue
+        task_ids+=("$tid")
+        task_files_map[$tid]="$files"
+    done < <(jq -c '.tasks[] | select(.status == "pending")' "$TASKS_FILE")
+
+    # Compare each pair of tasks for file overlaps
+    local sequentialized=""
+    for ((i=0; i<${#task_ids[@]}; i++)); do
+        for ((j=i+1; j<${#task_ids[@]}; j++)); do
+            local tid_a="${task_ids[$i]}"
+            local tid_b="${task_ids[$j]}"
+            local overlap=$(comm -12 \
+                <(echo "${task_files_map[$tid_a]}" | tr ' ' '\n' | sort) \
+                <(echo "${task_files_map[$tid_b]}" | tr ' ' '\n' | sort) \
+            )
+            if [[ -n "$overlap" ]]; then
+                local overlap_files=$(echo "$overlap" | tr '\n' ', ' | sed 's/,$//')
+                log "${YELLOW}⚠ Conflict:${NC} Tasks ${BLUE}$tid_a${NC} and ${BLUE}$tid_b${NC} both modify: $overlap_files — will run sequentially"
+                # Mark the second task with a dependency on the first
+                local tmp=$(mktemp)
+                jq --arg id "$tid_b" --arg dep "$tid_a" \
+                    '(.tasks[] | select(.id == $id)).dependsOn = $dep' \
+                    "$TASKS_FILE" > "$tmp" && mv "$tmp" "$TASKS_FILE"
+                conflicts_found=true
+            fi
+        done
+    done
+
+    $conflicts_found && return 0 || return 1
+}
+
 TASK_COUNT=$(jq '.tasks | length' "$TASKS_FILE")
 PENDING_TASKS=$(jq '[.tasks[] | select(.status == "pending")] | length' "$TASKS_FILE")
 
@@ -110,6 +156,11 @@ log "Max parallel: ${BLUE}$MAX_PARALLEL${NC}"
 log "Mode: ${BLUE}$MODE${NC}"
 log "CLI: ${BLUE}$CLAUDE_CMD${NC}"
 log "Logs: ${BLUE}$LOG_DIR${NC}"
+
+# Run conflict detection
+if detect_conflicts 2>/dev/null; then
+    log "Conflict detection adjusted task ordering"
+fi
 echo ""
 
 # Write initial state.json for dashboard
@@ -121,7 +172,8 @@ write_state() {
             id: .id,
             name: .name,
             status: .status,
-            model: (.model // "opus")
+            model: (.model // "opus"),
+            score: (.score // null)
         }]
     }' "$TASKS_FILE" > "$LOG_DIR/state.json" 2>/dev/null || true
 }
@@ -166,6 +218,9 @@ fi
 declare -A PIDS        # pid -> task_id
 declare -A TASK_NAMES  # task_id -> name
 declare -A TASK_STARTS # task_id -> start time
+declare -A TASK_BUDGETS  # task_id -> max bytes for stream (proxy for tokens)
+declare -A TASK_WARNED   # task_id -> whether 80% warning logged
+declare -A TASK_WORKDIRS # task_id -> workdir
 
 update_task_status() {
     local task_id="$1" new_status="$2"
@@ -173,6 +228,125 @@ update_task_status() {
     jq --arg id "$task_id" --arg s "$new_status" \
         '(.tasks[] | select(.id == $id)).status = $s' \
         "$TASKS_FILE" > "$tmp" && mv "$tmp" "$TASKS_FILE"
+}
+
+update_task_score() {
+    local task_id="$1" score="$2"
+    local tmp=$(mktemp)
+    jq --arg id "$task_id" --arg s "$score" \
+        '(.tasks[] | select(.id == $id)).score = $s' \
+        "$TASKS_FILE" > "$tmp" && mv "$tmp" "$TASKS_FILE"
+}
+
+# ─── Token budget defaults (mechanism 1) ───
+# Maps taskType to max stream bytes (rough proxy: 1 token ≈ 4 chars ≈ 4 bytes in stream)
+# 50k tokens ≈ 200KB stream, but stream-json has overhead so we use ~3x multiplier
+get_budget_bytes() {
+    local max_tokens="$1" task_type="$2"
+    if [[ -n "$max_tokens" && "$max_tokens" != "null" && "$max_tokens" != "0" ]]; then
+        echo $(( max_tokens * 12 ))  # ~12 bytes per token in stream-json format
+        return
+    fi
+    # Defaults by task type
+    case "$task_type" in
+        audit|review|read-only)  echo $(( 30000 * 12 )) ;;  # 30k tokens
+        verify|check)            echo $(( 15000 * 12 )) ;;  # 15k tokens
+        *)                       echo $(( 50000 * 12 )) ;;  # 50k tokens (fix/default)
+    esac
+}
+
+# ─── Scope lock file (mechanism 2) ───
+write_scope_lock() {
+    local task_id="$1" workdir="$2" allowed_files="$3"
+    [[ -z "$allowed_files" || "$allowed_files" == "null" ]] && return
+    local lock_file="$workdir/.fleet-lock"
+    jq -n --arg id "$task_id" --argjson files "$allowed_files" \
+        '{taskId: $id, allowedFiles: $files, created: now | todate}' \
+        > "$lock_file" 2>/dev/null || true
+}
+
+remove_scope_lock() {
+    local workdir="$1"
+    rm -f "$workdir/.fleet-lock" 2>/dev/null || true
+}
+
+# ─── Scope violation check (mechanism 2 post-check) ───
+check_scope_violations() {
+    local task_id="$1" workdir="$2" allowed_files_json="$3"
+    [[ -z "$allowed_files_json" || "$allowed_files_json" == "null" || "$allowed_files_json" == "[]" ]] && return
+
+    local violations_file="$LOG_DIR/${task_id}.scope-violations.log"
+
+    # Get files changed by git diff in workdir
+    local changed_files
+    changed_files=$(cd "$workdir" && git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+    [[ -z "$changed_files" ]] && return
+
+    # Check each changed file against allowed list
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        local allowed=false
+        while IFS= read -r pattern; do
+            [[ -z "$pattern" ]] && continue
+            # Support glob patterns
+            if [[ "$file" == $pattern ]]; then
+                allowed=true
+                break
+            fi
+        done < <(echo "$allowed_files_json" | jq -r '.[]' 2>/dev/null)
+
+        if ! $allowed; then
+            echo "$file" >> "$violations_file"
+            log "${YELLOW}⚠ Scope violation:${NC} Task $task_id modified $file (not in allowedFiles)"
+        fi
+    done <<< "$changed_files"
+}
+
+# ─── Diff size check ───
+check_diff_size() {
+    local task_id="$1" workdir="$2"
+    local diff_lines=0
+    diff_lines=$(cd "$workdir" && git diff --stat HEAD~1 HEAD 2>/dev/null | tail -1 | grep -oE '[0-9]+ insertion|[0-9]+ deletion' | grep -oE '[0-9]+' | paste -sd+ - | bc 2>/dev/null || echo "0")
+    echo "$diff_lines" > "$LOG_DIR/${task_id}.diff-lines"
+    echo "$diff_lines"
+}
+
+# ─── Score task (mechanism 4) ───
+score_task() {
+    local task_id="$1" workdir="$2" allowed_files_json="$3"
+    local score="PASS"
+    local issues=()
+
+    # Check output exists
+    local output_file="$LOG_DIR/${task_id}.output.md"
+    if [[ ! -f "$output_file" || ! -s "$output_file" ]]; then
+        score="FAIL"
+    fi
+
+    # Check stream size (wandering detection)
+    local stream_file="$LOG_DIR/${task_id}.stream.jsonl"
+    if [[ -f "$stream_file" ]]; then
+        local stream_size=$(wc -c < "$stream_file" | tr -d ' ')
+        if [[ $stream_size -gt 5242880 ]]; then  # >5MB
+            [[ "$score" != "FAIL" ]] && score="WARN"
+        fi
+    fi
+
+    # Check scope violations
+    check_scope_violations "$task_id" "$workdir" "$allowed_files_json"
+    if [[ -f "$LOG_DIR/${task_id}.scope-violations.log" && -s "$LOG_DIR/${task_id}.scope-violations.log" ]]; then
+        [[ "$score" != "FAIL" ]] && score="WARN"
+    fi
+
+    # Check diff size
+    local diff_lines
+    diff_lines=$(check_diff_size "$task_id" "$workdir")
+    if [[ $diff_lines -gt 500 ]]; then
+        [[ "$score" != "FAIL" ]] && score="WARN"
+    fi
+
+    update_task_score "$task_id" "$score"
+    echo "$score"
 }
 
 launch_task() {
@@ -186,11 +360,32 @@ launch_task() {
     local effort=$(echo "$task_json" | jq -r ".effort // \"$EFFORT\"")
     local allowed_tools=$(echo "$task_json" | jq -r '.allowedTools // ""')
     local append_prompt=$(echo "$task_json" | jq -r '.appendSystemPrompt // ""')
+    local max_tokens=$(echo "$task_json" | jq -r '.maxTokens // ""')
+    local task_type=$(echo "$task_json" | jq -r '.taskType // "fix"')
+    local allowed_files=$(echo "$task_json" | jq -c '.allowedFiles // []')
 
     local log_file="$LOG_DIR/${id}.log"
     local out_file="$LOG_DIR/${id}.output.md"
 
-    log "▶ Starting: ${GREEN}$name${NC} (id=$id, model=$model, effort=$effort)"
+    # Mechanism 5: Anti-wandering prompt injection
+    prompt="${ANTI_WANDER_PREFIX}
+
+${prompt}"
+
+    # Mechanism 1: Add budget awareness to system prompt
+    local budget_bytes
+    budget_bytes=$(get_budget_bytes "$max_tokens" "$task_type")
+    local budget_tokens=$(( budget_bytes / 12 ))
+    append_prompt="You have a token budget of approximately ${budget_tokens} tokens. Use them wisely — be direct, don't explore unnecessarily.${append_prompt:+
+
+$append_prompt}"
+
+    # Mechanism 2: Write scope lock file
+    if [[ "$allowed_files" != "[]" && "$allowed_files" != "null" ]]; then
+        write_scope_lock "$id" "$workdir" "$allowed_files"
+    fi
+
+    log "▶ Starting: ${GREEN}$name${NC} (id=$id, model=$model, budget=${budget_tokens}tok)"
 
     local stream_file="$LOG_DIR/${id}.stream.jsonl"
     local cmd=("$CLAUDE_CMD" --print --verbose --model "$model" --effort "$effort" --output-format stream-json)
@@ -214,8 +409,82 @@ launch_task() {
     PIDS[$pid]="$id"
     TASK_NAMES[$id]="$name"
     TASK_STARTS[$id]=$(date +%s)
+    TASK_BUDGETS[$id]="$budget_bytes"
+    TASK_WARNED[$id]="false"
+    TASK_WORKDIRS[$id]="$workdir"
     update_task_status "$id" "running"
     write_state
+}
+
+# ─── Budget enforcement (mechanism 1) ───
+check_budgets() {
+    for pid in "${!PIDS[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            continue
+        fi
+        local id="${PIDS[$pid]}"
+        local budget="${TASK_BUDGETS[$id]:-0}"
+        [[ "$budget" -eq 0 ]] && continue
+
+        local stream_file="$LOG_DIR/${id}.stream.jsonl"
+        [[ ! -f "$stream_file" ]] && continue
+
+        local current_size=$(wc -c < "$stream_file" 2>/dev/null | tr -d ' ')
+        local pct=$(( current_size * 100 / budget ))
+
+        # At 95%: force-stop
+        if [[ $pct -ge 95 ]]; then
+            log "${RED}⚠ Budget exceeded (95%):${NC} ${TASK_NAMES[$id]} — force stopping"
+            kill "$pid" 2>/dev/null || true
+            continue
+        fi
+
+        # At 80%: log warning (budget awareness is already in system prompt)
+        if [[ $pct -ge 80 && "${TASK_WARNED[$id]}" == "false" ]]; then
+            log "${YELLOW}⚠ Budget warning (80%):${NC} ${TASK_NAMES[$id]} — approaching limit"
+            TASK_WARNED[$id]="true"
+        fi
+    done
+}
+
+# ─── Checkpoint commits (mechanism 3) ───
+check_checkpoints() {
+    for pid in "${!PIDS[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            continue
+        fi
+        local id="${PIDS[$pid]}"
+        local budget="${TASK_BUDGETS[$id]:-0}"
+        [[ "$budget" -eq 0 ]] && continue
+
+        # Only checkpoint tasks with >30k token budget
+        local budget_tokens=$(( budget / 12 ))
+        [[ $budget_tokens -lt 30000 ]] && continue
+
+        local stream_file="$LOG_DIR/${id}.stream.jsonl"
+        [[ ! -f "$stream_file" ]] && continue
+
+        local current_size=$(wc -c < "$stream_file" 2>/dev/null | tr -d ' ')
+        local pct=$(( current_size * 100 / budget ))
+
+        # At 50%: checkpoint commit
+        local checkpoint_file="$LOG_DIR/${id}.checkpointed"
+        if [[ $pct -ge 50 && ! -f "$checkpoint_file" ]]; then
+            local workdir="${TASK_WORKDIRS[$id]}"
+            if [[ -d "$workdir/.git" ]]; then
+                (
+                    cd "$workdir"
+                    if [[ -n "$(git diff --name-only 2>/dev/null)" || -n "$(git diff --cached --name-only 2>/dev/null)" ]]; then
+                        git add -A 2>/dev/null && \
+                        git commit -m "WIP: [${TASK_NAMES[$id]}] checkpoint at 50% budget" --no-verify 2>/dev/null || true
+                        log "${BLUE}📌 Checkpoint:${NC} ${TASK_NAMES[$id]} — committed WIP at 50%"
+                    fi
+                ) &
+                wait $! 2>/dev/null || true
+            fi
+            touch "$checkpoint_file"
+        fi
+    done
 }
 
 # Reap completed tasks
@@ -229,16 +498,30 @@ reap() {
             local elapsed=$(( $(date +%s) - start ))
             local mins=$(( elapsed / 60 ))
             local secs=$(( elapsed % 60 ))
+            local workdir="${TASK_WORKDIRS[$id]:-"."}"
 
             wait "$pid" 2>/dev/null
             local exit_code=$?
 
+            # Clean up scope lock
+            remove_scope_lock "$workdir"
+
             if [[ $exit_code -eq 0 ]]; then
-                log "✓ ${GREEN}Completed${NC}: $name (${mins}m${secs}s)"
+                # Mechanism 4: Score the output
+                local allowed_files
+                allowed_files=$(jq -c --arg id "$id" '.tasks[] | select(.id == $id) | .allowedFiles // []' "$TASKS_FILE" 2>/dev/null || echo "[]")
+                local score
+                score=$(score_task "$id" "$workdir" "$allowed_files")
+                local score_color="$GREEN"
+                [[ "$score" == "WARN" ]] && score_color="$YELLOW"
+                [[ "$score" == "FAIL" ]] && score_color="$RED"
+
+                log "✓ ${GREEN}Completed${NC}: $name (${mins}m${secs}s) ${score_color}[$score]${NC}"
                 update_task_status "$id" "done"
             else
                 log "✗ ${RED}Failed${NC}: $name (exit=$exit_code, ${mins}m${secs}s)"
                 update_task_status "$id" "failed"
+                update_task_score "$id" "FAIL"
             fi
 
             unset "PIDS[$pid]"
@@ -253,14 +536,32 @@ cleanup() {
     for pid in "${!PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
+    # Clean up any remaining lock files
+    for id in "${!TASK_WORKDIRS[@]}"; do
+        remove_scope_lock "${TASK_WORKDIRS[$id]}"
+    done
     wait 2>/dev/null
     log "Done. Logs in: $LOG_DIR"
+    log "Run quality report: fleet-validate $TASKS_FILE $LOG_DIR"
 }
 trap cleanup EXIT INT TERM
+
+# ─── Check if a task's dependencies are satisfied (mechanism 6) ───
+is_task_ready() {
+    local task_json="$1"
+    local depends_on=$(echo "$task_json" | jq -r '.dependsOn // ""')
+    [[ -z "$depends_on" || "$depends_on" == "null" ]] && return 0
+
+    local dep_status=$(jq -r --arg id "$depends_on" '.tasks[] | select(.id == $id) | .status' "$TASKS_FILE" 2>/dev/null)
+    [[ "$dep_status" == "done" ]] && return 0
+    return 1
+}
 
 # Main loop
 while true; do
     reap
+    check_budgets
+    check_checkpoints
 
     running=${#PIDS[@]}
 
@@ -268,10 +569,14 @@ while true; do
     if [[ $slots -gt 0 ]]; then
         while IFS= read -r task_json; do
             [[ -z "$task_json" ]] && continue
+            # Mechanism 6: Check dependencies before launching
+            if ! is_task_ready "$task_json"; then
+                continue
+            fi
             launch_task "$task_json"
             slots=$(( slots - 1 ))
             [[ $slots -le 0 ]] && break
-        done < <(jq -c '.tasks[] | select(.status == "pending")' "$TASKS_FILE" | head -n "$slots")
+        done < <(jq -c '.tasks[] | select(.status == "pending")' "$TASKS_FILE")
     fi
 
     remaining=$(jq '[.tasks[] | select(.status == "pending" or .status == "running")] | length' "$TASKS_FILE")
@@ -281,8 +586,15 @@ while true; do
         echo ""
         done_count=$(jq '[.tasks[] | select(.status == "done")] | length' "$TASKS_FILE")
         fail_count=$(jq '[.tasks[] | select(.status == "failed")] | length' "$TASKS_FILE")
+
+        # Show quality summary
+        pass_count=$(jq '[.tasks[] | select(.score == "PASS")] | length' "$TASKS_FILE" 2>/dev/null || echo "0")
+        warn_count=$(jq '[.tasks[] | select(.score == "WARN")] | length' "$TASKS_FILE" 2>/dev/null || echo "0")
+
         log "Results: ${GREEN}$done_count done${NC}, ${RED}$fail_count failed${NC}"
+        log "Quality: ${GREEN}$pass_count PASS${NC}, ${YELLOW}$warn_count WARN${NC}, ${RED}$fail_count FAIL${NC}"
         log "Outputs in: $LOG_DIR/"
+        log "Full report: fleet-validate $TASKS_FILE $LOG_DIR"
         write_state
         break
     fi
