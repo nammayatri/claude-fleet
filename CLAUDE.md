@@ -53,6 +53,8 @@ examples/
 - allowedFiles: src/worker.js, src/utils.js
 - stage: 1
 - maxTurns: 10
+- dependsOn: task-a, task-b
+- autoVerify: true
 
 Prompt text here. Everything until the next ## heading.
 ```
@@ -77,7 +79,9 @@ Convert: `fleet-convert tasks.md tasks.json`
     "taskType": "fix",
     "allowedFiles": ["src/worker.js", "src/utils.js"],
     "stage": 1,
-    "maxTurns": 10
+    "maxTurns": 10,
+    "dependsOn": ["task-a", "task-b"],
+    "autoVerify": true
   }]
 }
 ```
@@ -97,6 +101,9 @@ Fleet includes 6 guardrails to prevent junk output:
 7. **Large file warnings** — Pre-flight check warns when `allowedFiles` targets files >500 lines.
 8. **Stage ordering** — `stage` field (1, 2, 3...) ensures verification tasks wait for fixes to complete.
 9. **Max turns** — `maxTurns` field limits agent tool-use rounds to prevent wandering.
+10. **DAG dependencies** — `dependsOn` supports arrays for multi-parent task graphs. Upstream outputs are auto-forwarded.
+11. **Auto-verify** — `autoVerify: true` auto-generates a read-only verify task that runs after the fix completes.
+12. **Output forwarding** — Downstream tasks receive upstream task outputs in their prompt context.
 
 Post-run: `fleet-validate tasks.json [log-dir]`
 

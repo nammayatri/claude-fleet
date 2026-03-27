@@ -169,10 +169,10 @@ detect_conflicts() {
             if [[ -n "$overlap" ]]; then
                 local overlap_files=$(echo "$overlap" | tr '\n' ', ' | sed 's/,$//')
                 log "${YELLOW}⚠ Conflict:${NC} Tasks ${BLUE}$tid_a${NC} and ${BLUE}$tid_b${NC} both modify: $overlap_files — will run sequentially"
-                # Mark the second task with a dependency on the first
+                # Mark the second task with a dependency on the first (append to array)
                 local tmp=$(mktemp)
                 jq --arg id "$tid_b" --arg dep "$tid_a" \
-                    '(.tasks[] | select(.id == $id)).dependsOn = $dep' \
+                    '(.tasks[] | select(.id == $id)).dependsOn = ((.tasks[] | select(.id == $id)).dependsOn // [] | if type == "string" then [.] else . end | . + [$dep] | unique)' \
                     "$TASKS_FILE" > "$tmp" && mv "$tmp" "$TASKS_FILE"
                 conflicts_found=true
             fi
@@ -196,6 +196,62 @@ preflight_large_file_check
 if detect_conflicts 2>/dev/null; then
     log "Conflict detection adjusted task ordering"
 fi
+
+# ─── Auto-verify injection ───
+# For tasks with autoVerify: true, generate a verification task that depends on them
+inject_auto_verify() {
+    local injected=0
+    local tmp
+    while IFS= read -r task_json; do
+        [[ -z "$task_json" ]] && continue
+        local tid=$(echo "$task_json" | jq -r '.id')
+        local tname=$(echo "$task_json" | jq -r '.name')
+        local workdir=$(echo "$task_json" | jq -r '.workdir // "."')
+        local model=$(echo "$task_json" | jq -r '.model // "sonnet"')
+        local task_stage=$(echo "$task_json" | jq -r '.stage // 0')
+        local allowed_files=$(echo "$task_json" | jq -c '.allowedFiles // []')
+        local verify_id="verify-${tid}"
+
+        # Skip if verify task already exists
+        local exists=$(jq --arg id "$verify_id" '[.tasks[] | select(.id == $id)] | length' "$TASKS_FILE" 2>/dev/null)
+        [[ "$exists" != "0" ]] && continue
+
+        local verify_stage=$(( task_stage + 1 ))
+        local verify_prompt="Verify the changes made by task '${tname}' (${tid}). Check that: 1) The code compiles/parses without errors. 2) The changes are minimal and focused. 3) No regressions were introduced. 4) If tests exist, they still pass. Report PASS or FAIL with a brief explanation."
+
+        tmp=$(mktemp)
+        jq --arg id "$verify_id" \
+           --arg name "Verify: ${tname}" \
+           --arg prompt "$verify_prompt" \
+           --arg workdir "$workdir" \
+           --arg model "$model" \
+           --argjson stage "$verify_stage" \
+           --arg dep "$tid" \
+           --argjson allowed_files "$allowed_files" \
+           '.tasks += [{
+               id: $id,
+               name: $name,
+               prompt: $prompt,
+               workdir: $workdir,
+               model: $model,
+               effort: "high",
+               status: "pending",
+               taskType: "verify",
+               maxTokens: 15000,
+               allowedTools: "Read Grep Glob Bash",
+               stage: $stage,
+               dependsOn: [$dep],
+               allowedFiles: $allowed_files
+           }]' "$TASKS_FILE" > "$tmp" && mv "$tmp" "$TASKS_FILE"
+
+        injected=$((injected + 1))
+        log "${BLUE}+ Auto-verify:${NC} ${verify_id} (depends on ${tid}, stage ${verify_stage})"
+    done < <(jq -c '.tasks[] | select(.autoVerify == true and .status == "pending")' "$TASKS_FILE")
+
+    [[ $injected -gt 0 ]] && log "Injected ${BLUE}$injected${NC} auto-verify tasks"
+}
+
+inject_auto_verify
 
 # Check for stage-based ordering
 HAS_STAGES=$(jq '[.tasks[] | select(.stage != null)] | length' "$TASKS_FILE" 2>/dev/null || echo "0")
@@ -410,6 +466,15 @@ launch_task() {
     local log_file="$LOG_DIR/${id}.log"
     local out_file="$LOG_DIR/${id}.output.md"
 
+    # Output forwarding: inject upstream task outputs into prompt
+    local upstream_context
+    upstream_context=$(get_upstream_context "$task_json")
+    if [[ -n "$upstream_context" ]]; then
+        prompt="${prompt}
+
+${upstream_context}"
+    fi
+
     # Mechanism 5: Anti-wandering prompt injection
     prompt="${ANTI_WANDER_PREFIX}
 
@@ -596,11 +661,22 @@ trap cleanup EXIT INT TERM
 is_task_ready() {
     local task_json="$1"
 
-    # Check explicit dependsOn (from conflict detection)
-    local depends_on=$(echo "$task_json" | jq -r '.dependsOn // ""')
-    if [[ -n "$depends_on" && "$depends_on" != "null" ]]; then
-        local dep_status=$(jq -r --arg id "$depends_on" '.tasks[] | select(.id == $id) | .status' "$TASKS_FILE" 2>/dev/null)
-        [[ "$dep_status" != "done" ]] && return 1
+    # Check explicit dependsOn — supports both string and array
+    local deps_type=$(echo "$task_json" | jq -r '.dependsOn | type // "null"' 2>/dev/null)
+    if [[ "$deps_type" == "array" ]]; then
+        # Array of dependency IDs — all must be done
+        local pending_deps=$(echo "$task_json" | jq -r '.dependsOn[]' 2>/dev/null | while read -r dep_id; do
+            [[ -z "$dep_id" ]] && continue
+            local s=$(jq -r --arg id "$dep_id" '.tasks[] | select(.id == $id) | .status' "$TASKS_FILE" 2>/dev/null)
+            [[ "$s" != "done" ]] && echo "blocked"
+        done)
+        [[ -n "$pending_deps" ]] && return 1
+    elif [[ "$deps_type" == "string" ]]; then
+        local depends_on=$(echo "$task_json" | jq -r '.dependsOn')
+        if [[ -n "$depends_on" && "$depends_on" != "null" ]]; then
+            local dep_status=$(jq -r --arg id "$depends_on" '.tasks[] | select(.id == $id) | .status' "$TASKS_FILE" 2>/dev/null)
+            [[ "$dep_status" != "done" ]] && return 1
+        fi
     fi
 
     # Check stage ordering: all tasks in earlier stages must be done/failed
@@ -613,6 +689,41 @@ is_task_ready() {
     fi
 
     return 0
+}
+
+# ─── Collect upstream outputs for a task (output forwarding) ───
+get_upstream_context() {
+    local task_json="$1"
+    local context=""
+
+    # Collect from dependsOn tasks
+    local deps_type=$(echo "$task_json" | jq -r '.dependsOn | type // "null"' 2>/dev/null)
+    local dep_ids=""
+    if [[ "$deps_type" == "array" ]]; then
+        dep_ids=$(echo "$task_json" | jq -r '.dependsOn[]' 2>/dev/null)
+    elif [[ "$deps_type" == "string" ]]; then
+        dep_ids=$(echo "$task_json" | jq -r '.dependsOn // empty' 2>/dev/null)
+    fi
+
+    [[ -z "$dep_ids" ]] && echo "" && return
+
+    while IFS= read -r dep_id; do
+        [[ -z "$dep_id" || "$dep_id" == "null" ]] && continue
+        local dep_name=$(jq -r --arg id "$dep_id" '.tasks[] | select(.id == $id) | .name' "$TASKS_FILE" 2>/dev/null)
+        local dep_output="$LOG_DIR/${dep_id}.output.md"
+        if [[ -f "$dep_output" && -s "$dep_output" ]]; then
+            # Take last 2000 chars to avoid blowing up context
+            local output_tail
+            output_tail=$(tail -c 2000 "$dep_output")
+            context="${context}
+--- Output from upstream task: ${dep_name} (${dep_id}) ---
+${output_tail}
+--- End upstream output ---
+"
+        fi
+    done <<< "$dep_ids"
+
+    echo "$context"
 }
 
 # Main loop
